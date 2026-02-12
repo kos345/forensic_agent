@@ -1,0 +1,23 @@
+# Forseti — Forensic Deep Agent
+# Python 3.11+
+
+# ===== Core =====
+pytsk3==20250801               # Forensic filesystem access (SleuthKit bindings)
+PyYAML==6.0.3                  # YAML configuration parsing
+python-dotenv==1.2.1           # Load environment variables from .env file
+python-dateutil==2.9.0.post0   # Date/time utilities
+
+# ===== LangChain & LangGraph =====
+langchain==1.2.9               # LangChain framework
+langchain-core==1.2.9          # LangChain core abstractions
+langgraph==1.0.8               # Graph-based agent workflows (LangGraph)
+
+# ===== Deep Agents SDK =====
+deepagents==0.3.12             # Deep Agent with sub-agents, todo list, mock filesystem
+
+# ===== GigaChat LLM =====
+gigachat==0.2.0                # GigaChat SDK
+langchain-gigachat-lc1==0.4.0b4  # GigaChat ↔ LangChain integration
+
+# ===== Optional: for image format conversion =====
+# qemu-img (system package: apt install qemu-utils)

@@ -1,0 +1,88 @@
+# Forensic Triage Configuration
+# Configuration file for artifact collection
+# Используется AI-агентом для сбора артефактов из образов дисков
+
+artifacts:
+  # System information files - файлы с информацией об ОС
+  system:
+    - /etc/os-release
+    - /etc/issue
+    - /etc/lsb-release
+    - /etc/redhat-release
+  
+  # User information files - файлы с информацией о пользователях
+  users:
+    - /etc/passwd
+    - /etc/shadow
+    - /etc/group
+    - /etc/gshadow
+  
+  # Command history patterns - паттерны файлов истории команд
+  history:
+    - /home/*/.bash_history
+    - /home/*/.zsh_history
+    - /root/.bash_history
+    - /root/.zsh_history
+    - /home/*/.history
+    - /root/.history
+  
+  # System services - системные сервисы
+  services:
+    - /etc/systemd/system
+    - /etc/init.d
+    - /etc/rc.d
+    - /etc/xinetd.d
+  
+  # Cron jobs - задачи cron
+  cron:
+    - /etc/crontab
+    - /var/spool/cron
+    - /etc/cron.d
+    - /etc/cron.daily
+    - /etc/cron.hourly
+    - /etc/cron.weekly
+    - /etc/cron.monthly
+  
+  # Package information - информация о пакетах
+  packages:
+    - /var/lib/dpkg/status  # Debian/Ubuntu
+    - /var/lib/rpm  # RedHat/CentOS
+    - /var/lib/pacman  # Arch Linux
+  
+  # Log directories - директории логов
+  logs:
+    var:
+      - /var/log
+    www:
+      - /var/www
+      - /usr/share/nginx
+      - /etc/nginx
+      - /etc/apache2
+      - /etc/httpd
+  
+  # Docker information - информация о Docker
+  docker:
+    - /var/lib/docker
+    - /etc/docker
+    - /root/.docker
+  
+  # Network configuration - сетевая конфигурация
+  network:
+    - /etc/hosts
+    - /etc/resolv.conf
+    - /etc/network
+    - /etc/sysconfig/network-scripts
+  
+  # SSH configuration - конфигурация SSH
+  ssh:
+    - /etc/ssh
+    - /root/.ssh
+    - /home/*/.ssh
+
+# Collection settings - настройки сбора
+settings:
+  max_files_per_directory: 200
+  max_log_files: 100
+  extract_compressed: true
+  calculate_hashes: true
+  generate_iocs: true
