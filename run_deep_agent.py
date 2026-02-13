@@ -95,9 +95,10 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры:
-  python run_deep_agent.py                          # defaults из CONFIGURATION
-  python run_deep_agent.py --image /data/disk.raw   # указать образ
-  python run_deep_agent.py --no-deep-agent          # без Deep Agent SDK
+  python run_deep_agent.py                                       # defaults из CONFIGURATION
+  python run_deep_agent.py --image /data/disk.raw                # указать образ
+  python run_deep_agent.py --no-deep-agent                       # без Deep Agent SDK
+  python run_deep_agent.py --image /data/disk.raw --message-history  # с историей сообщений LLM
         """
     )
     parser.add_argument(
@@ -119,21 +120,51 @@ def parse_args():
         default=not USE_DEEP_AGENT,
         help="Использовать только fallback (прямой LLM-анализ) вместо Deep Agent",
     )
+    parser.add_argument(
+        "--message-history",
+        action="store_true",
+        default=False,
+        help="Выводить в терминал все сообщения LLM и сохранить историю на диск",
+    )
+    parser.add_argument(
+        "--fs-depth",
+        type=int,
+        default=5,
+        help="Глубина выгрузки файловой системы образа в image_fs (по умолчанию: 5)",
+    )
     return parser.parse_args()
 
 
-def run(image_path: str, output_dir: str = None):
+def run(
+    image_path: str,
+    output_dir: str = None,
+    message_history: bool = False,
+    fs_depth: int = 5,
+):
     """
     Основная логика запуска агента.
 
     Вынесена из main() чтобы можно было вызывать программно:
         from run_deep_agent import run
         result = run("/path/to/disk.raw")
+        result = run("/path/to/disk.raw", message_history=True)
+
+    Args:
+        image_path: Путь к образу диска (RAW формат)
+        output_dir: Директория для сохранения отчёта (опционально)
+        message_history: Выводить и сохранять историю сообщений LLM
     """
+    # Инициализируем callback-логирование сообщений LLM
+    from src.utils.message_history import init_message_history
+    init_message_history(enabled=message_history)
+
     image_path = Path(image_path).resolve()
 
     if not image_path.exists():
         print(f"✗ Файл образа не найден: {image_path}")
+        return None
+    if fs_depth < 0:
+        print("✗ --fs-depth не может быть отрицательным")
         return None
 
     file_size_gb = image_path.stat().st_size / (1024 ** 3)
@@ -162,7 +193,7 @@ def run(image_path: str, output_dir: str = None):
     try:
         from src.agent.forensic_deep_agent import ForensicDeepAgent, run_deep_agent
 
-        result = run_deep_agent(str(image_path))
+        result = run_deep_agent(str(image_path), fs_depth=fs_depth)
 
         end_time = datetime.now()
         duration = end_time - start_time
@@ -194,7 +225,12 @@ def run(image_path: str, output_dir: str = None):
 def main():
     """Точка входа — работает и из CLI, и из PyCharm."""
     args = parse_args()
-    result = run(args.image, args.output_dir)
+    result = run(
+        args.image,
+        args.output_dir,
+        message_history=args.message_history,
+        fs_depth=args.fs_depth,
+    )
     sys.exit(0 if result else 1)
 
 

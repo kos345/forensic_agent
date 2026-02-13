@@ -49,15 +49,9 @@ from src.agent.prompts import (
 )
 from src.tools.image_manager import get_image_manager
 from src.tools import (
-    # Image tools
+    # Image tools (used only by open/close nodes)
     open_disk_image,
     close_disk_image,
-    get_os_info,
-    read_file_from_image,
-    list_directory_in_image,
-    extract_file_from_image,
-    get_file_metadata_from_image,
-    search_in_image_files,
     # Artifact tools
     collect_os_info,
     collect_users_info,
@@ -84,15 +78,18 @@ from src.tools import (
     record_finding,
     record_explored_path,
     get_investigation_store,
-    # Filesystem tools
+    # Filesystem tools (used by Deep Agent for image FS analysis)
     calculate_file_hashes,
+    get_local_file_metadata,
     read_local_file,
     write_local_file,
     list_local_directory,
     search_in_local_files,
+    extract_image_fs,
 )
 from src.utils.logger import get_logger
 from src.utils.filesystem import FileSystemUtils
+from src.utils.message_history import get_message_history
 
 # Load environment variables
 load_dotenv()
@@ -190,6 +187,11 @@ def create_gigachat_llm():
     if ca_bundle:
         kwargs["ca_bundle_file"] = ca_bundle
     
+    # Привязываем callback для логирования сообщений (если включён)
+    handler = get_message_history()
+    if handler:
+        kwargs["callbacks"] = [handler]
+    
     llm = GigaChat(**kwargs)
     logger.info(f"GigaChat LLM created: model={kwargs['model']}, timeout={gigachat_timeout}")
     return llm
@@ -200,13 +202,14 @@ def create_gigachat_llm():
 def get_all_forensic_tools() -> list:
     """Получить список всех forensic tools для Deep Agent."""
     return [
-        # Image tools
-        read_file_from_image,
-        list_directory_in_image,
-        extract_file_from_image,
-        get_file_metadata_from_image,
-        search_in_image_files,
-        # Artifact tools (сбор данных)
+        # Local filesystem tools (работа с выгруженной ФС образа в image_fs/)
+        read_local_file,
+        list_local_directory,
+        get_local_file_metadata,
+        search_in_local_files,
+        calculate_file_hashes,
+        write_local_file,
+        # Artifact tools (сбор данных через ImageManager)
         collect_os_info,
         collect_users_info,
         collect_command_history,
@@ -229,43 +232,35 @@ def get_all_forensic_tools() -> list:
         get_investigation_context,
         record_finding,
         record_explored_path,
-        # Local filesystem
-        calculate_file_hashes,
-        read_local_file,
-        write_local_file,
-        list_local_directory,
-        search_in_local_files,
     ]
 
 
-def create_forensic_deep_agent(llm=None):
+def create_forensic_deep_agent(llm=None, image_fs_dir: str = "image_fs"):
     """
     Создать Deep Agent для криминалистического анализа.
     
     Использует create_deep_agent из deepagents с:
     - GigaChat-2-Max как LLM
-    - Все forensic tools
+    - Все forensic tools (локальная ФС + артефакты + анализ)
     - Кастомный системный промпт
     - 4 субагента (service_analyzer, file_explorer, connection_analyzer, history_analyzer)
     
     Args:
         llm: BaseChatModel instance (если None, создаётся GigaChat)
+        image_fs_dir: Путь к локальной директории с выгруженной ФС образа
     
     Returns:
         CompiledStateGraph — скомпилированный Deep Agent
     """
     from deepagents import create_deep_agent
-    # try:
-    #     from deepagents import create_deep_agent
-    # except ImportError:
-    #     raise RuntimeError(
-    #         "deepagents is required. Install: pip install deepagents"
-    #     )
     
     if llm is None:
         llm = create_gigachat_llm()
     
     tools = get_all_forensic_tools()
+    
+    # Форматируем системный промпт с путём к выгруженной ФС
+    system_prompt = FORENSIC_SYSTEM_PROMPT.format(image_fs_dir=image_fs_dir)
     
     # Субагенты для делегирования специализированных задач
     subagents = [
@@ -278,7 +273,7 @@ def create_forensic_deep_agent(llm=None):
             ),
             "model": llm,
             "tools": [
-                read_file_from_image, list_directory_in_image,
+                read_local_file, list_local_directory,
                 collect_services_info, collect_cron_info, collect_packages_info,
                 record_finding, record_explored_path, get_investigation_context,
             ],
@@ -287,18 +282,17 @@ def create_forensic_deep_agent(llm=None):
         {
             "name": "file_explorer",
             "description": (
-                "Исследует файловую структуру образа диска. "
+                "Исследует файловую структуру образа диска (выгружена в локальную папку). "
                 "Находит нестандартные директории и файлы, скрытые файлы, "
                 "подозрительные скрипты и бинарники. "
-                "Используй для исследования конкретных директорий в образе."
+                "Используй для исследования конкретных директорий."
             ),
             "model": llm,
             "tools": [
-                read_file_from_image, list_directory_in_image,
-                extract_file_from_image, get_file_metadata_from_image,
-                search_in_image_files, extract_home_files,
-                record_finding, record_explored_path, get_investigation_context,
+                read_local_file, list_local_directory,
+                get_local_file_metadata, search_in_local_files,
                 calculate_file_hashes,
+                record_finding, record_explored_path, get_investigation_context,
             ],
             "system_prompt": FILE_EXPLORER_PROMPT,
         },
@@ -311,7 +305,7 @@ def create_forensic_deep_agent(llm=None):
             ),
             "model": llm,
             "tools": [
-                read_file_from_image, collect_auth_logs, collect_network_config,
+                read_local_file, collect_auth_logs, collect_network_config,
                 parse_ssh_successful_logins, extract_public_ips,
                 extract_entities_from_text,
                 record_finding, record_explored_path, get_investigation_context,
@@ -328,7 +322,7 @@ def create_forensic_deep_agent(llm=None):
             ),
             "model": llm,
             "tools": [
-                read_file_from_image, collect_command_history,
+                read_local_file, collect_command_history,
                 extract_public_ips, extract_entities_from_text,
                 record_finding, record_explored_path, get_investigation_context,
             ],
@@ -337,10 +331,10 @@ def create_forensic_deep_agent(llm=None):
     ]
     
     agent = create_deep_agent(
-        name="forseti",
+        name="forensic_deep_agent",
         model=llm,
         tools=tools,
-        system_prompt=FORENSIC_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         subagents=subagents,
     )
     
@@ -490,18 +484,53 @@ def _build_analysis_summary(analysis_result: Dict) -> str:
 
 # ==================== GRAPH NODES ====================
 
+def _cb_config(node: str) -> Optional[dict]:
+    """Собрать callback config для прямых tool.invoke() вызовов в graph-нодах."""
+    handler = get_message_history()
+    if not handler:
+        return None
+    handler.set_current_node(node)
+    return {"callbacks": [handler]}
+
+
 def open_image_node(state: ForensicAgentState) -> Dict:
     """Узел открытия образа диска."""
     print_phase("OPEN", f"Открытие образа: {state['image_path']}")
     
+    cb = _cb_config("open_image")
     messages = []
-    result_json = open_disk_image.invoke({"image_path": state['image_path']})
+    result_json = open_disk_image.invoke({"image_path": state['image_path']}, config=cb)
     result = json.loads(result_json)
     
     messages.append({'role': 'tool', 'tool': 'open_disk_image', 'content': result_json})
     
     if result.get('success'):
         print_status('success', "Образ открыт успешно")
+        fs_extract_depth = state.get("fs_extract_depth", 5)
+        project_root = Path(__file__).resolve().parent.parent.parent
+        image_fs_dir = project_root / "image_fs"
+        # Пропускаем выгрузку если папка уже существует и не пуста
+        if image_fs_dir.is_dir() and any(image_fs_dir.iterdir()):
+            print_status('info', f"Папка {image_fs_dir} уже содержит данные — выгрузка пропущена")
+        else:
+            print_status('info', f"Выгрузка файловой системы в {image_fs_dir} (глубина: {fs_extract_depth})")
+            extract_result = extract_image_fs(output_dir=str(image_fs_dir), max_depth=fs_extract_depth)
+            if extract_result.get("success"):
+                stats = extract_result.get("stats", {})
+                print_status(
+                    'success',
+                    f"ФС выгружена: dirs={stats.get('dirs_created', 0)}, files={stats.get('files_extracted', 0)}, "
+                    f"failed={stats.get('files_failed', 0)}",
+                )
+            else:
+                print_status('warning', f"Выгрузка ФС завершилась с ошибкой: {extract_result.get('error')}")
+                messages.append(
+                    {
+                        'role': 'tool',
+                        'tool': 'extract_image_fs',
+                        'content': json.dumps(extract_result, ensure_ascii=False),
+                    }
+                )
         return {
             'messages': messages,
             'image_open': True,
@@ -528,6 +557,7 @@ def collect_baseline_node(state: ForensicAgentState) -> Dict:
     """
     print_phase("BASELINE", "Сбор базовых артефактов из triage.yaml")
     
+    cb = _cb_config("collect_baseline")
     messages = []
     triage = TriageData()
     
@@ -563,7 +593,8 @@ def collect_baseline_node(state: ForensicAgentState) -> Dict:
         print_status('info', f"Запуск {tool_name}...")
         try:
             filtered_args = {k: v for k, v in tool_args.items() if v is not None}
-            result_json = tool_func.invoke(filtered_args if filtered_args else {})
+            invoke_args = filtered_args if filtered_args else {}
+            result_json = tool_func.invoke(invoke_args, config=cb)
             result = json.loads(result_json)
             triage.update_from_tool_result(tool_name, result)
             messages.append({'role': 'tool', 'tool': tool_name, 'content': result_json})
@@ -581,7 +612,7 @@ def collect_baseline_node(state: ForensicAgentState) -> Dict:
     # Алгоритмический анализ
     print_status('info', "Запуск алгоритмического анализа (analyze_triage_data)...")
     triage_json = json.dumps(triage_data, ensure_ascii=False)
-    analysis_json = analyze_triage_data.invoke({'triage_data_json': triage_json})
+    analysis_json = analyze_triage_data.invoke({'triage_data_json': triage_json}, config=cb)
     analysis_result = json.loads(analysis_json)
     
     recommendations = analysis_result.get('recommendations', [])
@@ -595,7 +626,7 @@ def collect_baseline_node(state: ForensicAgentState) -> Dict:
     
     messages.append({
         'role': 'assistant',
-        'content': f"Baseline сбор завершён. Аномалий: {len(anomalies)}, рекомендаций: {len(recommendations)}."
+        'content': f"Baseline сбор завершён. Аномалий: {len(anomalies)}, рекомендаций: {len(recommendations)}.",
     })
     
     return {
@@ -658,7 +689,14 @@ def deep_analysis_node(state: ForensicAgentState) -> Dict:
         ctx_parts.append("\nСфокусируйся на НЕИССЛЕДОВАННЫХ областях и углублённом анализе имеющихся находок.")
         investigation_context = "\n".join(ctx_parts)
     
-    task_message = build_deep_agent_task(triage_summary, analysis_summary, recommendations, investigation_context)
+    # Путь к выгруженной ФС образа
+    project_root = Path(__file__).resolve().parent.parent.parent
+    image_fs_dir = str(project_root / "image_fs")
+    
+    task_message = build_deep_agent_task(
+        triage_summary, analysis_summary, recommendations,
+        investigation_context, image_fs_dir=image_fs_dir,
+    )
     
     print_status('info', "Создание Deep Agent...")
     
@@ -668,10 +706,16 @@ def deep_analysis_node(state: ForensicAgentState) -> Dict:
     deep_agent_output = None
     llm_analyses = {}
     
+    # Конфиг для deep_agent.invoke() — с callbacks для real-time логирования
+    _handler = get_message_history()
+    _invoke_config: Dict[str, Any] = {"recursion_limit": 100}
+    if _handler:
+        _invoke_config["callbacks"] = [_handler]
+    
     try:
-        # Создаём Deep Agent
+        # Создаём Deep Agent (callback уже привязан к LLM через create_gigachat_llm)
         llm = create_gigachat_llm()
-        deep_agent = create_forensic_deep_agent(llm=llm)
+        deep_agent = create_forensic_deep_agent(llm=llm, image_fs_dir=image_fs_dir)
         
         print_status('success', "Deep Agent создан. Запуск анализа...")
         print_status('info', "Это может занять несколько минут...")
@@ -685,11 +729,11 @@ def deep_analysis_node(state: ForensicAgentState) -> Dict:
                     print_status('warning', f"Повторная попытка {_attempt}/{max_retries}...")
                     # Пересоздаём Deep Agent с увеличенным таймаутом
                     llm = create_gigachat_llm()
-                    deep_agent = create_forensic_deep_agent(llm=llm)
+                    deep_agent = create_forensic_deep_agent(llm=llm, image_fs_dir=image_fs_dir)
                 
                 result = deep_agent.invoke(
                     {"messages": [{"role": "user", "content": task_message}]},
-                    config={"recursion_limit": 100},
+                    config=_invoke_config,
                 )
                 
                 # Проверяем, были ли tool_calls (Deep Agent может просто написать текст)
@@ -703,7 +747,7 @@ def deep_analysis_node(state: ForensicAgentState) -> Dict:
                     # Deep Agent написал план, но не вызвал инструменты — повтор с усилением
                     print_status('warning', f"Попытка {_attempt}: Deep Agent не использовал инструменты ({_tc} tool calls). Повтор...")
                     llm = create_gigachat_llm()
-                    deep_agent = create_forensic_deep_agent(llm=llm)
+                    deep_agent = create_forensic_deep_agent(llm=llm, image_fs_dir=image_fs_dir)
                     continue
                 
                 break  # Успех — выходим из цикла
@@ -799,7 +843,8 @@ def deep_analysis_node(state: ForensicAgentState) -> Dict:
         print_status('info', "Используем fallback: прямой LLM-анализ через GigaChat...")
         
         deep_agent_output, llm_analyses = _fallback_llm_analysis(
-            triage_data, analysis_result, recommendations
+            triage_data, analysis_result, recommendations,
+            image_fs_dir=image_fs_dir,
         )
         
         messages.append({
@@ -829,7 +874,8 @@ def deep_analysis_node(state: ForensicAgentState) -> Dict:
         
         try:
             fallback_output, fallback_analyses = _fallback_llm_analysis(
-                triage_data, analysis_result, recommendations
+                triage_data, analysis_result, recommendations,
+                image_fs_dir=image_fs_dir,
             )
             # Дополняем llm_analyses только недостающими секциями
             for key in missing_keys:
@@ -862,7 +908,8 @@ def deep_analysis_node(state: ForensicAgentState) -> Dict:
 def _fallback_llm_analysis(
     triage_data: Dict,
     analysis_result: Dict,
-    recommendations: List[str]
+    recommendations: List[str],
+    image_fs_dir: str = "image_fs",
 ) -> tuple:
     """
     Fallback: прямой LLM-анализ через GigaChat без Deep Agents SDK.
@@ -881,6 +928,9 @@ def _fallback_llm_analysis(
         SUMMARIZE_USER_COMMANDS_PROMPT,
         IDENTIFY_NONSTANDARD_FILES_PROMPT,
     )
+    
+    # Устанавливаем текущий узел для логирования (LLM-вызовы + tool.invoke)
+    cb = _cb_config("fallback_analysis")
     
     llm = create_gigachat_llm()
     llm_analyses = {}
@@ -984,7 +1034,7 @@ def _fallback_llm_analysis(
                 auth_content = auth_logs
             
             if auth_content:
-                ssh_result_json = parse_ssh_successful_logins.invoke({"auth_log_content": auth_content})
+                ssh_result_json = parse_ssh_successful_logins.invoke({"auth_log_content": auth_content}, config=cb)
                 ssh_result = json.loads(ssh_result_json)
                 llm_analyses['ssh_logins'] = ssh_result
                 print_status('success', f"SSH входов: {ssh_result.get('total_logins', 0)}")
@@ -1002,7 +1052,7 @@ def _fallback_llm_analysis(
                 elif isinstance(cmds, str):
                     all_commands_text += cmds + "\n"
             
-            ips_result_json = extract_public_ips.invoke({"text": all_commands_text})
+            ips_result_json = extract_public_ips.invoke({"text": all_commands_text}, config=cb)
             ips_result = json.loads(ips_result_json)
             llm_analyses['public_ips'] = ips_result
             print_status('success', f"Публичных IP: {ips_result.get('total_public', 0)}")
@@ -1012,7 +1062,7 @@ def _fallback_llm_analysis(
     # 8. Нестандартные файлы в корне
     print_status('info', "Проверка корневой директории...")
     try:
-        root_listing_json = list_directory_in_image.invoke({"dir_path": "/"})
+        root_listing_json = list_local_directory.invoke({"dir_path": image_fs_dir}, config=cb)
         root_listing = json.loads(root_listing_json)
         if root_listing.get('success'):
             entries = root_listing.get('entries', [])
@@ -1153,6 +1203,9 @@ def evaluate_analysis_node(state: ForensicAgentState) -> Dict:
     )
     
     try:
+        # Устанавливаем текущий узел для логирования
+        _cb_config("evaluate_analysis")
+        
         llm = create_gigachat_llm()
         response = llm.invoke(prompt)
         content = getattr(response, 'content', str(response))
@@ -1275,7 +1328,7 @@ def generate_report_node(state: ForensicAgentState) -> Dict:
     
     messages.append({
         'role': 'assistant',
-        'content': f"Отчёт сгенерирован: {report_path}"
+        'content': f"Отчёт сгенерирован: {report_path} ({file_size} байт)"
     })
     
     return {
@@ -1290,8 +1343,9 @@ def close_image_node(state: ForensicAgentState) -> Dict:
     """Узел закрытия образа."""
     print_status('info', "Закрытие образа...")
     
+    cb = _cb_config("close_image")
     messages = []
-    result_json = close_disk_image.invoke({})
+    result_json = close_disk_image.invoke({}, config=cb)
     result = json.loads(result_json)
     messages.append({'role': 'tool', 'tool': 'close_disk_image', 'content': result_json})
     
@@ -1397,7 +1451,7 @@ class ForensicDeepAgent:
         self.graph = build_forensic_graph()
         self.app = self.graph.compile()
     
-    def run(self, image_path: str) -> Dict[str, Any]:
+    def run(self, image_path: str, fs_depth: int = 5) -> Dict[str, Any]:
         """
         Запустить полный анализ образа.
         
@@ -1433,6 +1487,7 @@ class ForensicDeepAgent:
             'errors': [],
             'analysis_iteration': 0,
             'max_iterations': 3,
+            'fs_extract_depth': fs_depth,
         }
         
         final_state = self.app.invoke(initial_state)
@@ -1453,10 +1508,15 @@ class ForensicDeepAgent:
         if final_state.get('errors'):
             print_status('warning', f"Ошибок: {len(final_state['errors'])}")
         
+        # Сохраняем историю сообщений на диск (если callback включён)
+        _handler = get_message_history()
+        if _handler:
+            _handler.save_to_disk()
+        
         return final_state
 
 
-def run_deep_agent(image_path: str) -> Dict[str, Any]:
+def run_deep_agent(image_path: str, fs_depth: int = 5) -> Dict[str, Any]:
     """
     Удобная функция для запуска Deep Forensic Agent.
     
@@ -1467,4 +1527,4 @@ def run_deep_agent(image_path: str) -> Dict[str, Any]:
         Финальное состояние агента
     """
     agent = ForensicDeepAgent()
-    return agent.run(image_path)
+    return agent.run(image_path, fs_depth=fs_depth)

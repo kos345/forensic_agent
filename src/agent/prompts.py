@@ -13,7 +13,7 @@ Prompts — Все промпты для Deep Forensic Agent.
 
 # ==================== ГЛАВНЫЙ СИСТЕМНЫЙ ПРОМПТ ====================
 
-FORENSIC_SYSTEM_PROMPT = """Ты — Forseti, AI-агент-эксперт по кибербезопасности и криминалистическому анализу Linux-серверов.
+FORENSIC_SYSTEM_PROMPT = """Ты — Forensic Agent, AI-ксперт по кибербезопасности и криминалистическому анализу Linux-серверов.
 
 ## ТВОЯ МИССИЯ
 Провести всесторонний интеллектуальный анализ образа диска Linux-сервера для выявления следов хакеров, кибер-злоумышленников и любой подозрительной активности. Ты должен обнаружить:
@@ -41,7 +41,7 @@ FORENSIC_SYSTEM_PROMPT = """Ты — Forseti, AI-агент-эксперт по 
 ### ФАЗА 1: Выполнение рекомендаций
 Прочитай recommendations и выполни каждую рекомендацию, используя доступные инструменты.
 Для каждой рекомендации:
-- Используй подходящий tool (list_directory_in_image, read_file_from_image, search_in_image_files и т.д.)
+- Используй подходящий tool (list_local_directory, read_local_file, search_in_local_files и т.д.)
 - Проанализируй результат
 - Зафиксируй находки через record_finding
 - Отметь исследованные пути через record_explored_path
@@ -75,12 +75,17 @@ FORENSIC_SYSTEM_PROMPT = """Ты — Forseti, AI-агент-эксперт по 
 ## ИНСТРУМЕНТЫ
 У тебя есть следующие инструменты:
 
-### Работа с образом диска:
-- `read_file_from_image(path)` — прочитать файл из образа
-- `list_directory_in_image(path)` — листинг директории в образе
-- `extract_file_from_image(image_path, output_path)` — извлечь файл из образа
-- `get_file_metadata_from_image(path)` — получить метаданные файла
-- `search_in_image_files(directory, pattern)` — поиск по файлам в образе
+### Работа с файловой системой образа (выгружена в {{image_fs_dir}}):
+ВАЖНО: Файловая система образа диска выгружена в локальную директорию {{image_fs_dir}}.
+Все пути к файлам образа формируй относительно этой директории.
+Например, для чтения /etc/passwd используй путь "{{image_fs_dir}}/etc/passwd".
+Для листинга корня образа используй dir_path="{{image_fs_dir}}".
+
+- `read_local_file(file_path)` — прочитать файл из выгруженной файловой системы образа
+- `list_local_directory(dir_path)` — листинг директории
+- `get_local_file_metadata(file_path)` — получить метаданные файла
+- `search_in_local_files(directory, pattern)` — поиск по содержимому файлов
+- `calculate_file_hashes(file_path)` — вычислить хеши файла (MD5, SHA1, SHA256)
 
 ### Сбор артефактов:
 - `collect_os_info()` — информация об ОС
@@ -175,7 +180,7 @@ bash, coreutils, dpkg, apt, systemd, login, passwd, openssh-server и подоб
 ### РАССУЖДЕНИЕ
 Для каждой проверки:
 - Сначала подумай: почему здесь может быть что-то подозрительное?
-- Проверь с помощью list_directory_in_image / read_file_from_image
+- Проверь с помощью list_local_directory / read_local_file
 - Проанализируй результаты
 - Зафиксируй находки и исследованные пути
 """
@@ -452,7 +457,8 @@ def build_deep_agent_task(
     triage_data_summary: str,
     analysis_summary: str,
     recommendations: list,
-    investigation_context: str = ""
+    investigation_context: str = "",
+    image_fs_dir: str = "image_fs",
 ) -> str:
     """
     Сформировать задание для Deep Agent на основе собранных данных.
@@ -487,7 +493,14 @@ def build_deep_agent_task(
 
 """
     
-    task += """### ПЛАН ДЕЙСТВИЙ:
+    task += f"""### РАСПОЛОЖЕНИЕ ФАЙЛОВОЙ СИСТЕМЫ ОБРАЗА
+Файловая система образа диска выгружена в локальную директорию: {image_fs_dir}
+Все пути формируй относительно этой директории. Например:
+- Корень образа: "{image_fs_dir}"
+- /etc/passwd в образе: "{image_fs_dir}/etc/passwd"
+- /home/ в образе: "{image_fs_dir}/home/"
+
+### ПЛАН ДЕЙСТВИЙ:
 
 1. **Выполни рекомендации** — используй инструменты для проверки каждой рекомендации
 2. **Исследуй неизученные области** — проверь директории, файлы, конфигурации
@@ -506,11 +519,11 @@ def build_deep_agent_task(
 ## КРИТИЧЕСКИ ВАЖНО — ОБЯЗАТЕЛЬНО ПРОЧТИ:
 - ТЫ ДОЛЖЕН ВЫЗЫВАТЬ ИНСТРУМЕНТЫ (tools). НЕ пиши план текстом — ВЫПОЛНЯЙ его через вызовы инструментов.
 - НИКОГДА не отвечай только текстом. Каждый твой ответ ДОЛЖЕН содержать хотя бы один вызов инструмента.
-- ПЕРВОЕ ДЕЙСТВИЕ: вызови list_directory_in_image с dir_path="/" чтобы увидеть корневую структуру.
+- ПЕРВОЕ ДЕЙСТВИЕ: вызови list_local_directory с dir_path="{image_fs_dir}" чтобы увидеть корневую структуру образа.
 - ЗАТЕМ: вызови collect_command_history чтобы получить историю команд.
 - ЗАТЕМ: для каждой подозрительной находки вызови record_finding.
 - ПРОДОЛЖАЙ вызывать инструменты пока не исследуешь все области.
 
-ДЕЙСТВУЙ СЕЙЧАС. Вызови list_directory_in_image(dir_path="/") ПРЯМО СЕЙЧАС.
+ДЕЙСТВУЙ СЕЙЧАС. Вызови list_local_directory(dir_path="{image_fs_dir}") ПРЯМО СЕЙЧАС.
 """
     return task

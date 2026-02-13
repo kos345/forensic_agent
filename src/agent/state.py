@@ -329,6 +329,7 @@ class ForensicAgentState(BaseAgentState):
     deep_agent_output: Optional[str]
     analysis_iteration: int
     max_iterations: int
+    fs_extract_depth: int
 
 
 # ==================== СИНХРОНИЗАЦИЯ STORE → STATE ====================

@@ -12,6 +12,7 @@ Forensic Tools Module - Инструменты для AI-агента
 """
 
 from .image_manager import ImageManager, get_image_manager
+from .extract_fs import extract_image_fs
 from .image_tools import (
     open_disk_image,
     close_disk_image,
@@ -69,6 +70,7 @@ __all__ = [
     # Image Manager
     'ImageManager',
     'get_image_manager',
+    'extract_image_fs',
     
     # Image Tools
     'open_disk_image',

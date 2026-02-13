@@ -1,4 +1,4 @@
-# Forseti — Детальная схема AI-агента
+# Forensic Agent — Детальная схема AI-агента
 
 ## 1. Общая архитектура проекта
 
@@ -42,87 +42,8 @@
 
 ---
 
-## 2. Simple Agent — Граф LangGraph
 
-**Файл:** `src/agent/simple_agent.py`  
-**Состояние:** `AgentState` (наследует `BaseAgentState`)  
-**Точка входа:** `run_agent.py`
-
-```
-                          ┌─────────┐
-                          │  START  │
-                          └────┬────┘
-                               │
-                               ▼
-                    ┌────────────────────┐
-                    │   open_image_node  │ ◄── Открытие образа диска
-                    │                    │     через open_disk_image tool
-                    └────────┬───────────┘
-                             │
-                    ┌────────┴────────┐
-                    │ image_open?     │ (route_after_open)
-                    ├── Yes ──────┐  │
-                    │             │  ├── No ──► END
-                    └─────────────┘  │
-                                     │
-                               ▼     │
-                ┌──────────────────────────┐
-                │  ollect_artifacts_nocde   │ ◄── Последовательный сбор
-                │                          │     12 типов артефактов
-                │  • collect_os_info       │     по triage.yaml
-                │  • collect_users_info    │
-                │  • collect_command_history│
-                │  • collect_services_info │
-                │  • collect_cron_info     │
-                │  • collect_packages_info │
-                │  • collect_docker_info   │
-                │  • collect_ssh_artifacts │
-                │  • collect_network_config│
-                │  • collect_auth_logs     │
-                │  • collect_logs_info     │
-                │  • extract_home_files    │
-                └────────────┬─────────────┘
-                             │
-                             ▼
-                ┌──────────────────────────┐
-                │     analyze_node         │
-                │                          │
-                │  Шаг 1: Алгоритмический  │ ◄── analyze_triage_data
-                │         анализ           │
-                │                          │
-                │  Шаг 2: LLM-анализ       │ ◄── GigaChat (GigaChatWrapper)
-                │         через GigaChat   │     Экспертное заключение
-                └────────────┬─────────────┘
-                             │
-                             ▼
-                ┌──────────────────────────┐
-                │  generate_report_node    │ ◄── Генерация HTML-отчёта
-                │                          │     + сохранение JSON-данных
-                │  • triage_data.json      │
-                │  • analysis_result.json  │
-                │  • report.html           │
-                └────────────┬─────────────┘
-                             │
-                    ┌────────┴────────┐
-                    │ image_open?     │ (route_after_report)
-                    ├── Yes ──────┐  │
-                    │             │  ├── No ──► END
-                    └─────────────┘  │
-                                     │
-                               ▼     │
-                    ┌────────────────────┐
-                    │  close_image_node  │ ◄── Закрытие образа
-                    └────────┬───────────┘
-                             │
-                             ▼
-                          ┌─────┐
-                          │ END │
-                          └─────┘
-```
-
----
-
-## 3. Deep Forensic Agent — Граф LangGraph с итеративным циклом
+## 2. Deep Forensic Agent — Граф LangGraph с итеративным циклом
 
 **Файл:** `src/agent/forensic_deep_agent.py`  
 **Состояние:** `ForensicAgentState` (расширяет `BaseAgentState`)  
@@ -164,7 +85,7 @@
                 │   │  Deep Agent SDK:         │         │
                 │   │  • GigaChat-2-Max LLM    │         │ (до max_iterations,
                 │   │  • 4 субагента           │         │  по умолчанию 3)
-                │   │  • 30+ forensic tools    │         │
+                │   │  • 26 forensic tools     │         │
                 │   │                          │         │
                 │   │  Fallback (без SDK):     │         │
                 │   │  • Прямой LLM-анализ     │         │
@@ -223,7 +144,7 @@
 
 ---
 
-## 4. Трёхуровневая архитектура Deep Agent
+## 3. Трёхуровневая архитектура Агента
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -241,7 +162,7 @@
 │  │                                                               │      │
 │  │  • LLM: GigaChat-2-Max                                       │      │
 │  │  • System Prompt: FORENSIC_SYSTEM_PROMPT (Chain of Thought)   │      │
-│  │  • Tools: 30+ forensic tools                                  │      │
+│  │  • Tools: 26 forensic tools                                   │      │
 │  │  • Middleware: TodoList, Filesystem, SubAgent                  │      │
 │  │  • Recursion Limit: 100                                       │      │
 │  │  • Retry: до 3 попыток при таймаутах                          │      │
@@ -259,9 +180,9 @@
 │  │ • Пакеты       │ │   структура    │ │ • Auth-логи      │             │
 │  │ • Cron-задачи  │ │ • Скрытые файлы│ │ • Сетевая        │             │
 │  │                │ │ • Скрипты      │ │   активность     │             │
-│  │ Tools: 7       │ │ • Бинарники    │ │ • IP-адреса      │             │
+│  │ Tools: 8       │ │ • Бинарники    │ │ • IP-адреса      │             │
 │  └────────────────┘ │                │ │                  │             │
-│                     │ Tools: 10      │ │ Tools: 8         │             │
+│                     │ Tools: 8       │ │ Tools: 9         │             │
 │  ┌────────────────┐ └────────────────┘ └─────────────────┘             │
 │  │ history_       │                                                     │
 │  │ analyzer       │                                                     │
@@ -280,7 +201,7 @@
 
 ---
 
-## 5. Инструменты (Tools) — полная карта
+## 4. Инструменты (Tools) — полная карта
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -346,273 +267,7 @@
 
 ---
 
-## 6. Управление состоянием
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        STATE MANAGEMENT                                 │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  ┌─────────────────────────────────────────┐                           │
-│  │ BaseAgentState (TypedDict)              │                           │
-│  │                                         │                           │
-│  │  messages: List[Dict]      ← operator.add (аддитивный reducer)     │
-│  │  image_path: str                        │                           │
-│  │  image_open: bool                       │                           │
-│  │  os_info: Optional[Dict]               │                           │
-│  │  triage_data: Optional[Dict]           │                           │
-│  │  analysis_result: Optional[Dict]       │                           │
-│  │  report_path: Optional[str]            │                           │
-│  │  current_step: str                      │                           │
-│  │  errors: List[str]                      │                           │
-│  └────────────────┬────────────────────────┘                           │
-│                   │                                                     │
-│          ┌────────┴────────┐                                           │
-│          │                 │                                            │
-│          ▼                 ▼                                            │
-│  ┌──────────────┐  ┌──────────────────────────────────────┐           │
-│  │ AgentState   │  │ ForensicAgentState                   │           │
-│  │              │  │                                      │           │
-│  │ (Simple      │  │ + recommendations: List[str]         │           │
-│  │  Agent —     │  │ + investigated_paths: List[Dict]     │ ← add    │
-│  │  без         │  │ + suspicious_findings: List[Dict]    │ ← add    │
-│  │  дополнений) │  │ + llm_analyses: Dict[str, Any]      │           │
-│  │              │  │ + report_data: Dict[str, Any]        │           │
-│  └──────────────┘  │ + deep_agent_output: Optional[str]   │           │
-│                    │ + analysis_iteration: int             │           │
-│                    │ + max_iterations: int                 │           │
-│                    └──────────────────────────────────────┘           │
-│                                                                         │
-│  ┌─────────────────────────────────────────────────────────────┐       │
-│  │ Дополнительные модели данных                                │       │
-│  │                                                             │       │
-│  │  TriageData          — собранные артефакты (12 категорий)   │       │
-│  │  InvestigatedPath    — запись об исследованном пути          │       │
-│  │  SuspiciousFinding   — запись о подозрительной находке       │       │
-│  └─────────────────────────────────────────────────────────────┘       │
-│                                                                         │
-│  ┌─────────────────────────────────────────────────────────────┐       │
-│  │ InvestigationStore (синглтон)                               │       │
-│  │                                                             │       │
-│  │  Боковой канал данных для Deep Agent:                       │       │
-│  │  • investigated_paths: List[InvestigatedPath]               │       │
-│  │  • suspicious_findings: List[SuspiciousFinding]             │       │
-│  │                                                             │       │
-│  │  Дельта-синхронизация с ForensicAgentState:                 │       │
-│  │  sync_store_to_state() → get_new_since_last_sync()          │       │
-│  │  (водяные метки _synced_*_count)                            │       │
-│  └─────────────────────────────────────────────────────────────┘       │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 7. Поток данных Deep Forensic Agent (детальная схема)
-
-```
-  ┌──────────────┐
-  │ Пользователь │
-  │ (CLI)        │
-  └──────┬───────┘
-         │  python run_deep_agent.py --image /path/to/disk.raw
-         ▼
-  ┌──────────────────────────────────────────────────────────────────┐
-  │ run_deep_agent.py                                                │
-  │                                                                  │
-  │  1. Проверка prerequisites (пакеты, .env)                       │
-  │  2. ForensicDeepAgent() → build_forensic_graph() → compile()    │
-  │  3. app.invoke(initial_state)                                   │
-  └──────────────────────┬───────────────────────────────────────────┘
-                         │
-   ═══════════════════════════════════════════════════════════════════
-   ║                LangGraph Execution                              ║
-   ═══════════════════════════════════════════════════════════════════
-                         │
-                         ▼
-  ┌──────────────────────────────────────────────────────────────────┐
-  │ УЗЕЛ 1: open_image_node                                          │
-  │                                                                  │
-  │  open_disk_image(image_path)                                     │
-  │       │                                                          │
-  │       ▼                                                          │
-  │  ImageManager.open_image() → pytsk3.Img_Info() + pytsk3.FS_Info()│
-  │       │                                                          │
-  │  state.image_open = True                                         │
-  └──────────────────────┬───────────────────────────────────────────┘
-                         │
-                         ▼
-  ┌──────────────────────────────────────────────────────────────────┐
-  │ УЗЕЛ 2: collect_baseline_node                                    │
-  │                                                                  │
-  │  ┌──────────────────────────────────┐                            │
-  │  │ configs/triage.yaml              │ ◄── Пути артефактов        │
-  │  │  artifacts:                      │                            │
-  │  │    system: [/etc/os-release, ...]│                            │
-  │  │    users: [/etc/passwd, ...]     │                            │
-  │  │    history: [/home/*/.bash_hist.]│                            │
-  │  │    services: [/etc/systemd/...]  │                            │
-  │  │    ssh: [/etc/ssh, /home/*/.ssh] │                            │
-  │  │    ...                           │                            │
-  │  └──────────────────────────────────┘                            │
-  │                                                                  │
-  │  ┌──────────────────────────────────────────┐                    │
-  │  │ Glob Resolution                          │                    │
-  │  │ /home/*/.bash_history                    │                    │
-  │  │   → list_directory(/home/)               │                    │
-  │  │   → [/home/user1/.bash_history,          │                    │
-  │  │      /home/user2/.bash_history, ...]     │                    │
-  │  └──────────────────────────────────────────┘                    │
-  │                                                                  │
-  │  12 artifact_tools ──► TriageData (dataclass) ──► triage_data    │
-  │                                                                  │
-  │  analyze_triage_data(triage_json) ──► analysis_result            │
-  │    • summary (статистика)                                        │
-  │    • anomalies (аномалии по severity)                            │
-  │    • recommendations (рекомендации для Deep Agent)               │
-  │                                                                  │
-  │  InvestigationStore.reset()                                      │
-  └──────────────────────┬───────────────────────────────────────────┘
-                         │
-   ╔═════════════════════╧═══════════════════════════════════════════╗
-   ║           ИТЕРАТИВНЫЙ ЦИКЛ ГЛУБОКОГО АНАЛИЗА                   ║
-   ╚═════════════════════╤═══════════════════════════════════════════╝
-                         │
-                         ▼
-  ┌──────────────────────────────────────────────────────────────────┐
-  │ УЗЕЛ 3: deep_analysis_node                                       │
-  │                                                                  │
-  │  build_deep_agent_task():                                        │
-  │    • triage_summary (сводка артефактов)                          │
-  │    • analysis_summary (результат алго-анализа)                   │
-  │    • recommendations (что проверить)                             │
-  │    • investigation_context (при итерации > 0)                    │
-  │                                                                  │
-  │  ┌────────────────────────────────────────────────────────────┐  │
-  │  │ Deep Agent (deepagents SDK)                                │  │
-  │  │                                                            │  │
-  │  │  LLM: GigaChat-2-Max                                      │  │
-  │  │  System Prompt: FORENSIC_SYSTEM_PROMPT                     │  │
-  │  │  Метод: Chain of Thought + Reflection                      │  │
-  │  │                                                            │  │
-  │  │  Фаза 1: Выполнение рекомендаций                           │  │
-  │  │    → list_directory_in_image("/")                           │  │
-  │  │    → read_file_from_image(...)                              │  │
-  │  │    → record_finding(category, severity, ...)               │  │
-  │  │    → record_explored_path(path, description)               │  │
-  │  │                                                            │  │
-  │  │  Фаза 2: Самостоятельное исследование                      │  │
-  │  │    → get_investigation_context()                            │  │
-  │  │    → Проверка /tmp, /var/tmp, /dev/shm, /opt, /root        │  │
-  │  │    → Поиск скрытых файлов, нестандартных директорий         │  │
-  │  │                                                            │  │
-  │  │  Фаза 3: Корреляция и связи                                │  │
-  │  │    → Связывание IP-адресов, файлов, временных меток         │  │
-  │  │    → Восстановление хронологии атаки                        │  │
-  │  │                                                            │  │
-  │  │  Делегирование субагентам:                                  │  │
-  │  │    → service_analyzer(сервисы, пакеты, cron)               │  │
-  │  │    → file_explorer(файловая структура)                      │  │
-  │  │    → connection_analyzer(SSH, сеть)                         │  │
-  │  │    → history_analyzer(история команд)                       │  │
-  │  └────────────────────────────────────────────────────────────┘  │
-  │                                                                  │
-  │  Fallback (если deepagents SDK не установлен):                   │
-  │  ┌────────────────────────────────────────────────────────────┐  │
-  │  │ _fallback_llm_analysis():                                  │  │
-  │  │  Прямой LLM-анализ GigaChat по 9 секциям:                  │  │
-  │  │  1. Анализ сервисов (ANALYZE_SERVICES_PROMPT)              │  │
-  │  │  2. Анализ cron (ANALYZE_CRON_PROMPT)                      │  │
-  │  │  3. Анализ пакетов (ANALYZE_PACKAGES_PROMPT)               │  │
-  │  │  4. Веб-серверы и ПО (ANALYZE_WEB_SOFTWARE_PROMPT)         │  │
-  │  │  5. Саммари по пользователям (SUMMARIZE_USER_COMMANDS)      │  │
-  │  │  6. Парсинг SSH-входов (parse_ssh_successful_logins)       │  │
-  │  │  7. Извлечение публичных IP (extract_public_ips)           │  │
-  │  │  8. Нестандартные файлы (IDENTIFY_NONSTANDARD_FILES)        │  │
-  │  │  9. Экспертное заключение (общий промпт)                   │  │
-  │  └────────────────────────────────────────────────────────────┘  │
-  │                                                                  │
-  │  sync_store_to_state(InvestigationStore)                         │
-  │    → Дельта: только новые paths и findings                       │
-  │    → Merge в ForensicAgentState через operator.add               │
-  └──────────────────────┬───────────────────────────────────────────┘
-                         │
-                         ▼
-  ┌──────────────────────────────────────────────────────────────────┐
-  │ УЗЕЛ 4: evaluate_analysis_node                                   │
-  │                                                                  │
-  │  EVALUATE_ANALYSIS_PROMPT:                                       │
-  │    • Статистика находок (по severity)                            │
-  │    • Количество исследованных путей                              │
-  │    • Сводка по находкам и рекомендациям                          │
-  │                                                                  │
-  │  LLM-вердикт (GigaChat):                                        │
-  │    {"verdict": "continue", "reason": "..."}                      │
-  │    или                                                           │
-  │    {"verdict": "sufficient", "reason": "..."}                    │
-  │                                                                  │
-  │  Правила:                                                        │
-  │    • 0 findings → "continue"                                     │
-  │    • < 5 paths → "continue"                                      │
-  │    • critical/high без related_paths → "continue"                │
-  │    • iteration >= max_iterations - 1 → "sufficient" (hard cap)   │
-  │                                                                  │
-  │  analysis_iteration += 1                                         │
-  └──────────────────────┬───────────────────────────────────────────┘
-                         │
-                ┌────────┴────────┐
-                │                 │
-      "continue"│                 │"sufficient"
-                │                 │
-                ▼                 ▼
-     ┌──────────────┐   ┌──────────────────┐
-     │ deep_analysis │   │  generate_report │
-     │ _node (↑)     │   │  _node           │
-     │ (повторная    │   │                  │
-     │  итерация)    │   │                  │
-     └──────────────┘   └────────┬─────────┘
-                                  │
-   ═══════════════════════════════╧═══════════════════════════════════
-                                  │
-                                  ▼
-  ┌──────────────────────────────────────────────────────────────────┐
-  │ УЗЕЛ 5: generate_report_node                                     │
-  │                                                                  │
-  │  Данные для отчёта:                                              │
-  │    • triage_data (baseline артефакты)                            │
-  │    • analysis_result (алгоритмический анализ)                    │
-  │    • llm_analyses (LLM-анализ по секциям)                       │
-  │    • investigated_paths (исследованные пути)                     │
-  │    • suspicious_findings (подозрительные находки)                │
-  │    • deep_agent_output (экспертное заключение)                   │
-  │                                                                  │
-  │  generate_comprehensive_html_report(report_data)                 │
-  │    → 8 секций HTML-отчёта (см. раздел 9)                        │
-  │                                                                  │
-  │  Файлы: output/<timestamp>/                                      │
-  │    • comprehensive_report.html                                   │
-  │    • report_data.json                                            │
-  │    • triage_data.json                                            │
-  │    • analysis_result.json                                        │
-  └──────────────────────┬───────────────────────────────────────────┘
-                         │
-                         ▼
-  ┌──────────────────────────────────────────────────────────────────┐
-  │ УЗЕЛ 6: close_image_node                                         │
-  │                                                                  │
-  │  close_disk_image()                                              │
-  │  state.image_open = False                                        │
-  └──────────────────────┬───────────────────────────────────────────┘
-                         │
-                         ▼
-                      ┌─────┐
-                      │ END │
-                      └─────┘
-```
-
----
-
-## 8. Система промптов
+## 5. Система промптов
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -623,15 +278,15 @@
 │  ┌─────────────────────────────────────────────────────────────┐       │
 │  │ FORENSIC_SYSTEM_PROMPT (Deep Agent)                         │       │
 │  │                                                             │       │
-│  │ Роль: Forseti — AI-агент-эксперт по кибербезопасности       │       │
+│  │ Роль: Forensic Agent — AI-эксперт по кибербезопасности      │       │
 │  │ Метод: Chain of Thought (Наблюдение → Гипотеза →            │       │
 │  │        Проверка → Вывод)                                    │       │
-│  │ Фазы: 1) Рекомендации  2) Исследование                     │       │
+│  │ Фазы: 1) Рекомендации  2) Исследование                      │       │
 │  │        3) Корреляция    4) Детальный анализ                 │       │
 │  │ Правила: record_finding, record_explored_path,              │       │
 │  │          get_investigation_context обязательны              │       │
 │  └─────────────────────────────────────────────────────────────┘       │
-│                                                                         │
+│                                                                        │
 │  ┌─────────────────────────────────────────────────────────────┐       │
 │  │ Промпты субагентов                                          │       │
 │  │                                                             │       │
@@ -665,7 +320,7 @@
 
 ---
 
-## 9. Структура HTML-отчёта
+## 6. Структура HTML-отчёта
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -717,10 +372,10 @@
 
 ---
 
-## 10. Структура файлов проекта
+## 7. Структура файлов проекта
 
 ```
-Forseti_cursor/
+forensic_agent_local_fs/
 ├── run_agent.py                  # Точка входа — Simple Agent
 ├── run_deep_agent.py             # Точка входа — Deep Forensic Agent
 ├── requirements.txt              # Зависимости Python
@@ -731,7 +386,8 @@ Forseti_cursor/
 │   ├── main.py                   # ForensicPipeline — preprocessing образа
 │   ├── agent/
 │   │   ├── __init__.py           # Экспорт агентов и состояний
-│   │   ├── state.py              # AgentState, ForensicAgentState, TriageData,
+│   │   ├── state.py              # BaseAgentState, AgentState,
+│   │   │                         # ForensicAgentState, TriageData,
 │   │   │                         # InvestigatedPath, SuspiciousFinding,
 │   │   │                         # sync_store_to_state
 │   │   ├── simple_agent.py       # ForensicAgent — простой 5-узловой граф
@@ -743,25 +399,28 @@ Forseti_cursor/
 │   │   ├── __init__.py
 │   │   └── image_processor.py    # ImageProcessor — конвертация образов
 │   ├── tools/
-│   │   ├── __init__.py           # Экспорт всех 35+ tools
+│   │   ├── __init__.py           # Экспорт всех 40+ tools
 │   │   ├── image_manager.py      # ImageManager (pytsk3) — доступ к образу
 │   │   ├── image_tools.py        # 8 tools работы с образом
 │   │   ├── artifact_tools.py     # 15 tools сбора артефактов
 │   │   ├── analysis_tools.py     # 6 tools анализа данных
 │   │   ├── investigation_tools.py# 5 tools + InvestigationStore
-│   │   └── filesystem_tools.py   # 6 tools локальной ФС
+│   │   ├── filesystem_tools.py   # 6 tools локальной ФС
+│   │   └── extract_fs.py         # Выгрузка ФС образа в локальную директорию
 │   └── utils/
 │       ├── __init__.py
 │       ├── logger.py             # Логирование
-│       └── filesystem.py         # FileSystemUtils
-├── output/                       # Выходные данные (отчёты)
+│       ├── filesystem.py         # FileSystemUtils
+│       └── message_history.py    # Callback для перехвата LLM-сообщений
+├── output/                       # Выходные данные (отчёты, история сообщений)
 ├── extracted/                    # Извлечённые файлы
+├── image_fs/                     # Выгруженная файловая система образа
 └── logs/                         # Логи работы
 ```
 
 ---
 
-## 11. Ключевые технологии и зависимости
+## 8. Ключевые технологии и зависимости
 
 | Компонент | Технология | Назначение |
 |-----------|-----------|------------|
