@@ -90,21 +90,90 @@ class InvestigationStore:
     
     def add_explored_path(self, path: str, description: str, suspicious: bool = False,
                           findings_refs: Optional[List[str]] = None) -> InvestigatedPath:
-        """Добавить исследованный путь."""
+        """Добавить исследованный путь с дедупликацией.
+
+        При совпадении path: объединяет описания, findings_refs,
+        повышает suspicious если новый вызов помечен как suspicious.
+        """
+        findings_refs = findings_refs or []
+
+        # Дедупликация по path
+        for existing in self.investigated_paths:
+            if existing.path == path:
+                # Объединяем описание (если новое отличается)
+                if description and description not in existing.description:
+                    existing.description = f"{existing.description}; {description}"
+                # OR suspicious
+                if suspicious:
+                    existing.suspicious = True
+                # Объединяем findings_refs
+                for ref in findings_refs:
+                    if ref and ref not in existing.findings_refs:
+                        existing.findings_refs.append(ref)
+                logger.info(f"Дубликат пути '{path}' — объединено")
+                return existing
+
         record = InvestigatedPath(
             path=path,
             description=description,
             suspicious=suspicious,
-            findings_refs=findings_refs or [],
+            findings_refs=findings_refs,
         )
         self.investigated_paths.append(record)
         return record
     
+    def _find_duplicate(self, category: str, title: str) -> Optional[SuspiciousFinding]:
+        """Найти дубликат находки по (category, normalized_title).
+
+        Сравнение без учёта регистра и пробелов по краям.
+
+        Returns:
+            Существующий SuspiciousFinding если дубликат найден, иначе None.
+        """
+        norm_title = title.strip().lower()
+        for f in self.suspicious_findings:
+            if f.category == category and f.title.strip().lower() == norm_title:
+                return f
+        return None
+
     def add_finding(self, category: str, severity: str, title: str,
                     details: str, evidence: Optional[List[str]] = None,
                     related_paths: Optional[List[str]] = None,
                     related_findings: Optional[List[str]] = None) -> SuspiciousFinding:
-        """Добавить подозрительную находку."""
+        """Добавить подозрительную находку с дедупликацией.
+
+        Проверяет дубликат по (category, title) без учёта регистра.
+        При совпадении: объединяет evidence, related_paths, related_findings
+        и повышает severity если новая находка более критична.
+        Новая находка НЕ создаётся — возвращается существующая.
+        """
+        evidence = evidence or []
+        related_paths = related_paths or []
+        related_findings_list = related_findings or []
+
+        # Дедупликация: поиск существующей находки с тем же (category, title)
+        existing = self._find_duplicate(category, title)
+        if existing:
+            # Объединяем evidence
+            for e in evidence:
+                if e and e not in existing.evidence:
+                    existing.evidence.append(e)
+            # Объединяем related_paths
+            for p in related_paths:
+                if p and p not in existing.related_paths:
+                    existing.related_paths.append(p)
+            # Объединяем related_findings
+            for rf in related_findings_list:
+                if rf and rf not in existing.related_findings:
+                    existing.related_findings.append(rf)
+            # Повышаем severity если новая находка более критична
+            _sev_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4}
+            if _sev_order.get(severity, 5) < _sev_order.get(existing.severity, 5):
+                existing.severity = severity
+            logger.info(f"Дубликат находки [{category}] '{title}' — объединено с {existing.id}")
+            return existing
+
+        # Новая находка
         finding_id = f"FIND-{uuid.uuid4().hex[:8].upper()}"
         record = SuspiciousFinding(
             id=finding_id,
@@ -112,9 +181,9 @@ class InvestigationStore:
             severity=severity,
             title=title,
             details=details,
-            evidence=evidence or [],
-            related_paths=related_paths or [],
-            related_findings=related_findings or [],
+            evidence=evidence,
+            related_paths=related_paths,
+            related_findings=related_findings_list,
         )
         self.suspicious_findings.append(record)
         return record
@@ -158,7 +227,7 @@ _PRIVATE_NETWORKS = [
 IP_RE = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
 
 
-def _is_public_ip(ip_str: str) -> bool:
+def is_public_ip(ip_str: str) -> bool:
     """Проверить, является ли IP-адрес публичным (не RFC1918, не loopback и т.д.)."""
     try:
         addr = ipaddress.ip_address(ip_str)
@@ -213,8 +282,8 @@ def extract_public_ips(text: str) -> str:
         except ValueError:
             continue
     
-    public_ips = sorted(set(ip for ip in valid_ips if _is_public_ip(ip)))
-    private_ips = sorted(set(ip for ip in valid_ips if not _is_public_ip(ip)))
+    public_ips = sorted(set(ip for ip in valid_ips if is_public_ip(ip)))
+    private_ips = sorted(set(ip for ip in valid_ips if not is_public_ip(ip)))
     
     result = {
         "success": True,

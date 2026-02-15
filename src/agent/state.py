@@ -110,7 +110,10 @@ class TriageData:
             
             # IOCs
             'iocs': self.iocs,
-            
+
+            # Извлечённые файлы
+            'extracted_files': self.extracted_files,
+
             # Метаданные
             'os_info': self.os_info,
             'collection_timestamp': self.collection_timestamp,

@@ -39,6 +39,8 @@ from .artifact_tools import (
     extract_log_file,
     extract_home_files,
     clear_tool_cache,
+    scan_home_files_for_malware,
+    read_home_files_for_analysis,
 )
 from .analysis_tools import (
     extract_entities_from_text,
@@ -64,6 +66,15 @@ from .investigation_tools import (
     record_explored_path,
     get_investigation_store,
     InvestigationStore,
+)
+from .log_analyzers import (
+    analyze_utmp_logs,
+    analyze_auth_logs_detailed,
+    analyze_lastlog,
+    analyze_dpkg_logs,
+    analyze_history_commands,
+    analyze_alternatives_logs,
+    clear_log_analyzer_cache,
 )
 
 __all__ = [
@@ -98,6 +109,8 @@ __all__ = [
     'extract_log_file',
     'extract_home_files',
     'clear_tool_cache',
+    'scan_home_files_for_malware',
+    'read_home_files_for_analysis',
     
     # Analysis Tools
     'extract_entities_from_text',
@@ -123,4 +136,13 @@ __all__ = [
     'record_explored_path',
     'get_investigation_store',
     'InvestigationStore',
+
+    # Log Analyzers
+    'analyze_utmp_logs',
+    'analyze_auth_logs_detailed',
+    'analyze_lastlog',
+    'analyze_dpkg_logs',
+    'analyze_history_commands',
+    'analyze_alternatives_logs',
+    'clear_log_analyzer_cache',
 ]

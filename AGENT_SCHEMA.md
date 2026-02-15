@@ -20,15 +20,16 @@
 │  │                  │         │                           │              │
 │  │ LangGraph:       │         │ LangGraph Orchestrator    │              │
 │  │ 5 узлов          │         │ + Deep Agent SDK          │              │
-│  │ + GigaChat LLM   │         │ + 4 субагента             │              │
-│  └────────┬────────┘         │ + GigaChat LLM            │              │
+│  │ + GigaChat LLM   │         │ + 5 субагентов            │              │
+│  └────────┬────────┘         │   + general-purpose       │              │
+│           │                  │ + GigaChat LLM            │              │
 │           │                  └────────────┬──────────────┘              │
 │           │                                │                            │
 │           ▼                                ▼                            │
 │  ┌──────────────────────────────────────────────────────┐              │
 │  │                    TOOLS LAYER                        │              │
 │  │  image_tools │ artifact_tools │ analysis_tools        │              │
-│  │  filesystem_tools │ investigation_tools               │              │
+│  │  filesystem_tools │ investigation_tools │ log_analyzers│              │
 │  └──────────────────────────┬───────────────────────────┘              │
 │                             │                                           │
 │                             ▼                                           │
@@ -71,7 +72,10 @@
                     │                           │     сбор артефактов
                     │  • 12 artifact tools       │
                     │  • triage.yaml конфиг      │
+                    │  • 6 log analyzers         │ ◄── Глубокий анализ логов
                     │  • analyze_triage_data     │ ◄── Алгоритмический анализ
+                    │  • scan_home_files_for_    │
+                    │    malware                 │ ◄── Детекция malware
                     │  • Формирование            │
                     │    recommendations         │
                     └─────────────┬─────────────┘
@@ -84,8 +88,9 @@
                 │   │                          │         │ ЦИКЛ АНАЛИЗА
                 │   │  Deep Agent SDK:         │         │
                 │   │  • GigaChat-2-Max LLM    │         │ (до max_iterations,
-                │   │  • 4 субагента           │         │  по умолчанию 3)
-                │   │  • 26 forensic tools     │         │
+                │   │  • 5 субагентов +        │         │  по умолчанию 3)
+                │   │    general-purpose       │         │
+                │   │  • 30+ forensic tools    │         │
                 │   │                          │         │
                 │   │  Fallback (без SDK):     │         │
                 │   │  • Прямой LLM-анализ     │         │
@@ -155,15 +160,16 @@
 │                                                   → generate_report     │
 │                                                     → close_image → END │
 ├─────────────────────────────────────────────────────────────────────────┤
-│  LAYER 2: Deep Agent (deepagents SDK / create_deep_agent)               │
+│  LAYER 2: Deep Agent (deepagents SDK / create_agent)                    │
 │                                                                         │
 │  ┌───────────────────────────────────────────────────────────────┐      │
 │  │  Forseti Deep Agent                                           │      │
 │  │                                                               │      │
 │  │  • LLM: GigaChat-2-Max                                       │      │
 │  │  • System Prompt: FORENSIC_SYSTEM_PROMPT (Chain of Thought)   │      │
-│  │  • Tools: 26 forensic tools                                   │      │
-│  │  • Middleware: TodoList, Filesystem, SubAgent                  │      │
+│  │  • Tools: 30+ forensic tools                                  │      │
+│  │  • Middleware: TodoList, SubAgent, Summarization,              │      │
+│  │    PatchToolCalls                                              │      │
 │  │  • Recursion Limit: 100                                       │      │
 │  │  • Retry: до 3 попыток при таймаутах                          │      │
 │  └────────────────────────┬──────────────────────────────────────┘      │
@@ -184,18 +190,20 @@
 │  └────────────────┘ │                │ │                  │             │
 │                     │ Tools: 8       │ │ Tools: 9         │             │
 │  ┌────────────────┐ └────────────────┘ └─────────────────┘             │
-│  │ history_       │                                                     │
-│  │ analyzer       │                                                     │
-│  │                │                                                     │
-│  │ Анализ:        │                                                     │
-│  │ • История      │                                                     │
-│  │   команд       │                                                     │
-│  │ • Публичные IP │                                                     │
-│  │ • Подозритель- │                                                     │
-│  │   ные команды  │                                                     │
-│  │                │                                                     │
-│  │ Tools: 7       │                                                     │
-│  └────────────────┘                                                     │
+│  │ history_       │ ┌──────────────────┐                               │
+│  │ analyzer       │ │ file_content_    │                               │
+│  │                │ │ analyzer         │                               │
+│  │ Анализ:        │ │                  │                               │
+│  │ • История      │ │ Анализ:          │                               │
+│  │   команд       │ │ • Содержимое     │                               │
+│  │ • Публичные IP │ │   файлов         │                               │
+│  │ • Подозритель- │ │ • Malware/       │                               │
+│  │   ные команды  │ │   backdoor       │                               │
+│  │                │ │ • Подозрительные  │                               │
+│  │ Tools: 7       │ │   паттерны       │                               │
+│  └────────────────┘ │                  │                               │
+│                     │ Tools: 6         │                               │
+│                     └──────────────────┘                               │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -234,6 +242,8 @@
 │             │  clean_command_history    — очистка дубликатов            │
 │             │  extract_log_file        — извлечение лог-файла          │
 │             │  clear_tool_cache        — очистка кэша                  │
+│             │  scan_home_files_for_malware — детекция malware           │
+│             │  read_home_files_for_analysis — чтение файлов для LLM    │
 │             │                                                           │
 ├─────────────┼───────────────────────────────────────────────────────────┤
 │             │                                                           │
@@ -261,6 +271,19 @@
 │  ФС)        │  write_local_file         — запись в локальный файл       │
 │             │  list_local_directory     — листинг локальной директории  │
 │             │  search_in_local_files    — поиск в локальных файлах      │
+│             │                                                           │
+├─────────────┼───────────────────────────────────────────────────────────┤
+│             │                                                           │
+│ LOG         │  analyze_utmp_logs       — анализ btmp/wtmp (брутфорс,   │
+│ ANALYZERS   │                           успешные входы, статистика)    │
+│ (глубокий   │  analyze_auth_logs_detailed — auth.log (sudo, failed,    │
+│  анализ     │                              IP-статистика)              │
+│  логов)     │  analyze_lastlog         — lastlog (последние входы)     │
+│             │  analyze_dpkg_logs       — dpkg.log (установка пакетов)  │
+│             │  analyze_history_commands — bash_history (подозрительные  │
+│             │                            команды, статистика)          │
+│             │  analyze_alternatives_logs — alternatives (изменения)    │
+│             │  clear_log_analyzer_cache — очистка кэша анализаторов    │
 │             │                                                           │
 └─────────────┴───────────────────────────────────────────────────────────┘
 ```
@@ -290,10 +313,11 @@
 │  ┌─────────────────────────────────────────────────────────────┐       │
 │  │ Промпты субагентов                                          │       │
 │  │                                                             │       │
-│  │  SERVICE_ANALYZER_PROMPT    — анализ сервисов, пакетов      │       │
-│  │  FILE_EXPLORER_PROMPT       — анализ файловой структуры     │       │
-│  │  CONNECTION_ANALYZER_PROMPT — анализ SSH/сети                │       │
-│  │  HISTORY_ANALYZER_PROMPT    — анализ истории команд          │       │
+│  │  SERVICE_ANALYZER_PROMPT       — анализ сервисов, пакетов   │       │
+│  │  FILE_EXPLORER_PROMPT          — анализ файловой структуры  │       │
+│  │  CONNECTION_ANALYZER_PROMPT    — анализ SSH/сети             │       │
+│  │  HISTORY_ANALYZER_PROMPT       — анализ истории команд       │       │
+│  │  FILE_CONTENT_ANALYZER_PROMPT  — анализ содержимого файлов  │       │
 │  └─────────────────────────────────────────────────────────────┘       │
 │                                                                         │
 │  ┌─────────────────────────────────────────────────────────────┐       │
@@ -352,6 +376,14 @@
 │     ├── Успешные SSH-входы (таблица)                                   │
 │     └── Сводка по IP-адресам                                           │
 │                                                                         │
+│  4a. 📊 Детальный анализ логов                                          │
+│     ├── btmp/wtmp — неудачные/успешные входы, брутфорс-статистика      │
+│     ├── auth.log — sudo-команды, failed-логины, IP-статистика          │
+│     ├── lastlog — последние входы пользователей                        │
+│     ├── dpkg.log — установка/удаление пакетов                          │
+│     ├── bash_history — подозрительные команды, статистика               │
+│     └── alternatives — изменения системных альтернатив                  │
+│                                                                         │
 │  5. 👤 Активность пользователей                                         │
 │     ├── 5.1 История команд (по пользователям)                          │
 │     ├── 5.2 Публичные IP-адреса из команд                              │
@@ -402,10 +434,11 @@ forensic_agent_local_fs/
 │   │   ├── __init__.py           # Экспорт всех 40+ tools
 │   │   ├── image_manager.py      # ImageManager (pytsk3) — доступ к образу
 │   │   ├── image_tools.py        # 8 tools работы с образом
-│   │   ├── artifact_tools.py     # 15 tools сбора артефактов
+│   │   ├── artifact_tools.py     # 17 tools сбора артефактов
 │   │   ├── analysis_tools.py     # 6 tools анализа данных
 │   │   ├── investigation_tools.py# 5 tools + InvestigationStore
 │   │   ├── filesystem_tools.py   # 6 tools локальной ФС
+│   │   ├── log_analyzers.py      # 6 анализаторов логов (btmp/wtmp, auth, lastlog, dpkg, history, alternatives)
 │   │   └── extract_fs.py         # Выгрузка ФС образа в локальную директорию
 │   └── utils/
 │       ├── __init__.py
@@ -426,9 +459,10 @@ forensic_agent_local_fs/
 |-----------|-----------|------------|
 | Оркестрация | **LangGraph** (StateGraph) | Граф выполнения агента с условными рёбрами |
 | LLM | **GigaChat-2-Max** (langchain-gigachat) | Экспертный анализ, оценка, генерация текста |
-| Deep Agent | **deepagents SDK** (create_deep_agent) | Автономный агент с субагентами и middleware |
+| Deep Agent | **deepagents SDK** (create_agent) | Автономный агент с субагентами и middleware |
 | Доступ к образу | **pytsk3** (The Sleuth Kit) | Чтение файловой системы из RAW-образа диска |
 | Preprocessing | **qemu-img** (через subprocess) | Конвертация VMDK/QCOW2/VDI → RAW |
 | Конфигурация | **YAML** (configs/triage.yaml) | Пути артефактов для сбора |
 | Переменные окружения | **.env** (python-dotenv) | API-ключи GigaChat |
 | Tools Framework | **langchain_core.tools** (@tool) | Декораторы инструментов для LLM |
+| Анализ логов | **pandas** | Статистический анализ btmp/wtmp, auth.log, dpkg и др. |

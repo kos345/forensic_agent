@@ -7,7 +7,9 @@
 - **Автоматический сбор артефактов** — пользователи, сервисы, cron, пакеты, SSH, Docker, история команд, логи авторизации
 - **Алгоритмический анализ** — выявление аномалий (подозрительные команды, UID 0, нестандартные сервисы и т.д.)
 - **Интеллектуальный анализ (LLM)** — экспертный анализ собранных данных с помощью GigaChat-2-Max
-- **Deep Agent** — многоитерационное расследование с субагентами (анализ сервисов, файлов, SSH, истории команд)
+- **Глубокий анализ логов** — статистический анализ btmp/wtmp, auth.log, lastlog, dpkg, bash_history, alternatives
+- **Детекция malware** — детерминированный regex-сканер файлов в /home/ и /root/ (reverse shell, backdoor, криптомайнеры)
+- **Deep Agent** — многоитерационное расследование с 5 субагентами + general-purpose
 - **Chain of Thought + Reflection** — методичный пошаговый анализ с самопроверкой
 - **HTML-отчёт** — всеобъемлющий отчёт с находками, статистикой и экспертным заключением
 
@@ -24,10 +26,11 @@
 │                                       generate_report → END   │
 │                                                                │
 │  Layer 2: Deep Agent (deepagents SDK)                         │
-│    ├── service_analyzer   (анализ сервисов, пакетов, cron)    │
-│    ├── file_explorer      (файловая структура, скрытые файлы) │
-│    ├── connection_analyzer (SSH, сетевая активность)           │
-│    └── history_analyzer   (история команд, подозрительные IoC) │
+│    ├── service_analyzer      (сервисы, пакеты, cron)          │
+│    ├── file_explorer         (файловая структура, скрытые)    │
+│    ├── connection_analyzer   (SSH, сетевая активность)        │
+│    ├── history_analyzer      (история команд, IoC)            │
+│    └── file_content_analyzer (содержимое файлов, malware)     │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -52,18 +55,22 @@ Forensic Agent/
 │   ├── preprocessing/
 │   │   └── image_processor.py   # Обработка образов (определение типа, конвертация)
 │   ├── tools/
+│   │   ├── image_manager.py     # ImageManager (pytsk3) — доступ к образу
 │   │   ├── image_tools.py       # Работа с образом диска (pytsk3)
 │   │   ├── artifact_tools.py    # Сбор криминалистических артефактов
 │   │   ├── analysis_tools.py    # Анализ данных (IoC, парсинг)
-│   │   ├── investigation_tools.py  # Управление расследованием
+│   │   ├── investigation_tools.py  # InvestigationStore + управление расследованием
 │   │   ├── filesystem_tools.py  # Утилиты локальной ФС
-│   │   └── image_manager.py     # Менеджер открытого образа
+│   │   ├── log_analyzers.py     # 6 анализаторов логов (btmp/wtmp, auth, lastlog, dpkg, history, alternatives)
+│   │   └── extract_fs.py        # Выгрузка ФС образа в локальную директорию
 │   └── utils/
 │       ├── logger.py            # Логирование
-│       └── filesystem.py        # Утилиты файловой системы
+│       ├── filesystem.py        # Утилиты файловой системы
+│       └── message_history.py   # Callback для перехвата LLM-сообщений
 ├── output/                      # Результаты анализа (создаётся автоматически)
-├── logs/                        # Логи (создаётся автоматически)
-└── extracted/                   # Извлечённые файлы (создаётся автоматически)
+├── extracted/                   # Извлечённые файлы (создаётся автоматически)
+├── image_fs/                    # Выгруженная файловая система образа (создаётся автоматически)
+└── logs/                        # Логи (создаётся автоматически)
 ```
 
 ## 🚀 Установка
@@ -100,8 +107,8 @@ pip install -r requirements.txt
 Или с использованием conda:
 
 ```bash
-conda create -n forensic_agent python=3.11
-conda activate forensic_agent
+conda create -n forensic_agent_env python=3.11
+conda activate forensic_agent_env
 pip install -r requirements.txt
 ```
 
@@ -123,6 +130,8 @@ GIGACHAT_VERIFY_SSL=true
 
 ## 📖 Использование
 
+Предварительно необходимо указать GIGACHAT_CREDENTIALS в файле .env
+
 ### Deep Agent (рекомендуется)
 
 ```bash
@@ -131,6 +140,9 @@ python run_deep_agent.py --image /path/to/disk.raw
 
 # С указанием директории для результатов
 python run_deep_agent.py --image /path/to/disk.raw --output-dir ./results
+
+# С указанием включения логирования сообщений LLM
+python run_deep_agent.py --image /path/to/disk.raw --message-history
 ```
 
 ### Простой агент
@@ -207,6 +219,7 @@ artifacts:
 2. **Сведения о системе** — ОС, пользователи, сервисы, cron, пакеты, Docker
 3. **Информация о файлах** — нестандартные файлы в корне, /home/, /root/
 4. **Подключения (SSH)** — успешные SSH-входы, IP-адреса
+4a. **Детальный анализ логов** — btmp/wtmp, auth.log, lastlog, dpkg, bash_history, alternatives
 5. **Активность пользователей** — история команд, публичные IP, саммари
 6. **Подозрительные находки** — все обнаруженные IoC с severity-уровнем
 7. **Экспертное заключение** — анализ от LLM
@@ -229,8 +242,9 @@ artifacts:
 ## 🛠 Стек технологий
 
 - **[LangGraph](https://github.com/langchain-ai/langgraph)** — оркестрация workflow агента
-- **[Deep Agents SDK](https://docs.langchain.com/oss/python/deepagents/overview)** — субагенты, планирование, виртуальная ФС
+- **[Deep Agents SDK](https://docs.langchain.com/oss/python/deepagents/overview)** — субагенты, планирование, middleware
 - **[GigaChat](https://developers.sber.ru/portal/products/gigachat)** — LLM для интеллектуального анализа
 - **[pytsk3](https://github.com/py4n6/pytsk)** — доступ к файловым системам образов дисков
 - **[LangChain](https://www.langchain.com/)** — фреймворк для работы с LLM
+- **[pandas](https://pandas.pydata.org/)** — статистический анализ логов
 

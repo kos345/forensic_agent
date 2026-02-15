@@ -3,27 +3,29 @@ Forensic Deep Agent — Интеллектуальный AI-агент для к
 
 Архитектура:
   Layer 1: LangGraph Orchestrator (ForensicAgentState)
-    ├── open_image_node         (детерминированный)
-    ├── collect_baseline_node   (детерминированный: triage.yaml + analyze_triage_data)
+    ├── open_image_node         (детерминированный: открытие образа + извлечение ФС)
+    ├── collect_baseline_node   (детерминированный: triage.yaml + analyze_triage_data + log_analyzers)
     ├── deep_analysis_node      (Deep Agent: рекомендации → исследование → корреляция)
-    ├── generate_report_node    (формирование всеобъемлющего HTML-отчёта)
+    ├── evaluate_analysis_node  (LLM-оценка: продолжить/завершить цикл)
+    ├── generate_report_node    (формирование HTML-отчёта)
     └── close_image_node        (детерминированный)
-  
-  Layer 2: Deep Agent (create_deep_agent)
-    - GigaChat-2-Max + все forensic tools
-    - TodoListMiddleware + FilesystemMiddleware + SubAgentMiddleware
-  
+
+  Layer 2: Deep Agent (create_agent + кастомный middleware)
+    - GigaChat-2-Max + forensic tools
+    - TodoListMiddleware + SubAgentMiddleware + SummarizationMiddleware + PatchToolCallsMiddleware
+
   Layer 3: Subagents
     - service_analyzer: анализ сервисов, пакетов, cron
     - file_explorer: исследование файловой структуры
     - connection_analyzer: анализ SSH-подключений
     - history_analyzer: анализ истории команд
+    - file_content_analyzer: анализ содержимого файлов на malware
 
 Использует:
-  - deepagents (create_deep_agent) — Deep Agent SDK
+  - deepagents (create_agent + middleware) — Deep Agent SDK
   - langgraph (StateGraph) — оркестрация workflow
-  - langchain-gigachat (GigaChat) — LLM
-  - Существующие tools проекта для сбора и анализа артефактов
+  - langchain-gigachat (GigaChat-2-Max) — LLM
+  - tools проекта: artifact_tools, analysis_tools, log_analyzers, investigation_tools, filesystem_tools
 """
 
 import json
@@ -45,6 +47,7 @@ from src.agent.prompts import (
     FILE_EXPLORER_PROMPT,
     CONNECTION_ANALYZER_PROMPT,
     HISTORY_ANALYZER_PROMPT,
+    FILE_CONTENT_ANALYZER_PROMPT,
     build_deep_agent_task,
 )
 from src.tools.image_manager import get_image_manager
@@ -57,6 +60,8 @@ from src.tools import (
     collect_users_info,
     collect_command_history,
     collect_services_info,
+    scan_home_files_for_malware,
+    read_home_files_for_analysis,
     collect_cron_info,
     collect_packages_info,
     collect_docker_info,
@@ -86,7 +91,16 @@ from src.tools import (
     list_local_directory,
     search_in_local_files,
     extract_image_fs,
+    # Log analyzers
+    analyze_utmp_logs,
+    analyze_auth_logs_detailed,
+    analyze_lastlog,
+    analyze_dpkg_logs,
+    analyze_history_commands,
+    analyze_alternatives_logs,
+    clear_log_analyzer_cache,
 )
+from src.tools.investigation_tools import is_public_ip
 from src.utils.logger import get_logger
 from src.utils.filesystem import FileSystemUtils
 from src.utils.message_history import get_message_history
@@ -197,38 +211,61 @@ def create_gigachat_llm():
     return llm
 
 
+# ==================== TOOL OUTPUT TRUNCATION ====================
+
+MAX_TOOL_OUTPUT_CHARS = 6000  # ≈ 2048 токенов для русского/JSON текста
+
+
+def _truncate_tool_output(text: str, max_chars: int = MAX_TOOL_OUTPUT_CHARS) -> str:
+    """Обрезать вывод инструмента до ~2048 токенов."""
+    if not isinstance(text, str) or len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"\n\n...[вывод обрезан: {len(text)} → {max_chars} символов (~2048 токенов)]"
+
+
+def _wrap_with_truncation(tool, max_chars: int = MAX_TOOL_OUTPUT_CHARS):
+    """Обернуть LangChain tool для обрезки вывода до ~2048 токенов.
+
+    Создаёт новый StructuredTool с той же схемой аргументов,
+    но обрезающий результат если он превышает max_chars.
+    """
+    from langchain_core.tools import StructuredTool
+
+    original_func = tool.func
+
+    def truncated_func(*args, **kwargs):
+        result = original_func(*args, **kwargs)
+        return _truncate_tool_output(result, max_chars)
+
+    return StructuredTool.from_function(
+        func=truncated_func,
+        name=tool.name,
+        description=tool.description,
+        args_schema=tool.args_schema,
+        infer_schema=False,
+    )
+
+
 # ==================== DEEP AGENT FACTORY ====================
 
 def get_all_forensic_tools() -> list:
-    """Получить список всех forensic tools для Deep Agent."""
+    """Получить список forensic tools для Deep Agent (только ФС и анализ).
+    """
     return [
-        # Local filesystem tools (работа с выгруженной ФС образа в image_fs/)
+        # Работа с файловой системой образа (выгружена в image_fs/)
         read_local_file,
         list_local_directory,
         get_local_file_metadata,
         search_in_local_files,
         calculate_file_hashes,
         write_local_file,
-        # Artifact tools (сбор данных через ImageManager)
-        collect_os_info,
-        collect_users_info,
-        collect_command_history,
-        collect_services_info,
-        collect_cron_info,
-        collect_packages_info,
-        collect_docker_info,
-        collect_ssh_artifacts,
-        collect_network_config,
-        collect_auth_logs,
-        collect_logs_info,
-        extract_home_files,
-        # Analysis tools
+        # Анализ и парсинг
         extract_entities_from_text,
         parse_passwd_file,
         parse_services_list,
         extract_public_ips,
         parse_ssh_successful_logins,
-        # Investigation management
+        # Управление расследованием
         get_investigation_context,
         record_finding,
         record_explored_path,
@@ -238,32 +275,70 @@ def get_all_forensic_tools() -> list:
 def create_forensic_deep_agent(llm=None, image_fs_dir: str = "image_fs"):
     """
     Создать Deep Agent для криминалистического анализа.
-    
-    Использует create_deep_agent из deepagents с:
-    - GigaChat-2-Max как LLM
-    - Все forensic tools (локальная ФС + артефакты + анализ)
-    - Кастомный системный промпт
-    - 4 субагента (service_analyzer, file_explorer, connection_analyzer, history_analyzer)
-    
+
+    Использует create_agent (не create_deep_agent) с кастомным middleware стеком
+    БЕЗ FilesystemMiddleware — чтобы GigaChat не видел виртуальные ФС-инструменты
+    (read_file, ls, edit_file, glob, grep) и вызывал только forensic-инструменты.
+
+    Middleware стек:
+    - TodoListMiddleware — планирование задач
+    - SubAgentMiddleware — делегирование 5 субагентам + general-purpose
+    - SummarizationMiddleware — сжатие контекста (критично для GigaChat)
+    - PatchToolCallsMiddleware — исправление tool calls
+
     Args:
         llm: BaseChatModel instance (если None, создаётся GigaChat)
         image_fs_dir: Путь к локальной директории с выгруженной ФС образа
-    
+
     Returns:
         CompiledStateGraph — скомпилированный Deep Agent
     """
-    from deepagents import create_deep_agent
-    
+    from langchain.agents import create_agent
+    from langchain.agents.middleware import TodoListMiddleware
+    from deepagents.backends import StateBackend
+    from deepagents.middleware.subagents import SubAgentMiddleware, GENERAL_PURPOSE_SUBAGENT
+    from deepagents.middleware.summarization import SummarizationMiddleware, _compute_summarization_defaults
+    from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
+
     if llm is None:
         llm = create_gigachat_llm()
-    
-    tools = get_all_forensic_tools()
-    
+
+    # Оборачиваем все инструменты для обрезки вывода до ~2048 токенов
+    raw_tools = get_all_forensic_tools()
+    tools = [_wrap_with_truncation(t) for t in raw_tools]
+    _t = {t.name: t for t in tools}  # маппинг по имени для субагентов
+
     # Форматируем системный промпт с путём к выгруженной ФС
     system_prompt = FORENSIC_SYSTEM_PROMPT.format(image_fs_dir=image_fs_dir)
-    
-    # Субагенты для делегирования специализированных задач
+
+    # Backend и настройки суммаризации
+    backend = lambda rt: StateBackend(rt)
+    summarization_defaults = _compute_summarization_defaults(llm)
+
+    def _build_subagent_middleware():
+        """Middleware стек для субагентов (без FilesystemMiddleware)."""
+        return [
+            TodoListMiddleware(),
+            SummarizationMiddleware(
+                model=llm,
+                backend=backend,
+                trigger=summarization_defaults["trigger"],
+                keep=summarization_defaults["keep"],
+                trim_tokens_to_summarize=None,
+                truncate_args_settings=summarization_defaults["truncate_args_settings"],
+            ),
+            PatchToolCallsMiddleware(),
+        ]
+
+    # Субагенты с явным middleware (без FilesystemMiddleware), обрезанными инструментами
     subagents = [
+        # General-purpose субагент (fallback для задач вне специализации)
+        {
+            **GENERAL_PURPOSE_SUBAGENT,
+            "model": llm,
+            "tools": tools,
+            "middleware": _build_subagent_middleware(),
+        },
         {
             "name": "service_analyzer",
             "description": (
@@ -273,11 +348,11 @@ def create_forensic_deep_agent(llm=None, image_fs_dir: str = "image_fs"):
             ),
             "model": llm,
             "tools": [
-                read_local_file, list_local_directory,
-                collect_services_info, collect_cron_info, collect_packages_info,
-                record_finding, record_explored_path, get_investigation_context,
+                _t['read_local_file'], _t['list_local_directory'], _t['search_in_local_files'],
+                _t['record_finding'], _t['record_explored_path'], _t['get_investigation_context'],
             ],
             "system_prompt": SERVICE_ANALYZER_PROMPT,
+            "middleware": _build_subagent_middleware(),
         },
         {
             "name": "file_explorer",
@@ -289,12 +364,13 @@ def create_forensic_deep_agent(llm=None, image_fs_dir: str = "image_fs"):
             ),
             "model": llm,
             "tools": [
-                read_local_file, list_local_directory,
-                get_local_file_metadata, search_in_local_files,
-                calculate_file_hashes,
-                record_finding, record_explored_path, get_investigation_context,
+                _t['read_local_file'], _t['list_local_directory'],
+                _t['get_local_file_metadata'], _t['search_in_local_files'],
+                _t['calculate_file_hashes'],
+                _t['record_finding'], _t['record_explored_path'], _t['get_investigation_context'],
             ],
             "system_prompt": FILE_EXPLORER_PROMPT,
+            "middleware": _build_subagent_middleware(),
         },
         {
             "name": "connection_analyzer",
@@ -305,12 +381,13 @@ def create_forensic_deep_agent(llm=None, image_fs_dir: str = "image_fs"):
             ),
             "model": llm,
             "tools": [
-                read_local_file, collect_auth_logs, collect_network_config,
-                parse_ssh_successful_logins, extract_public_ips,
-                extract_entities_from_text,
-                record_finding, record_explored_path, get_investigation_context,
+                _t['read_local_file'], _t['list_local_directory'],
+                _t['parse_ssh_successful_logins'], _t['extract_public_ips'],
+                _t['extract_entities_from_text'],
+                _t['record_finding'], _t['record_explored_path'], _t['get_investigation_context'],
             ],
             "system_prompt": CONNECTION_ANALYZER_PROMPT,
+            "middleware": _build_subagent_middleware(),
         },
         {
             "name": "history_analyzer",
@@ -322,23 +399,55 @@ def create_forensic_deep_agent(llm=None, image_fs_dir: str = "image_fs"):
             ),
             "model": llm,
             "tools": [
-                read_local_file, collect_command_history,
-                extract_public_ips, extract_entities_from_text,
-                record_finding, record_explored_path, get_investigation_context,
+                _t['read_local_file'], _t['list_local_directory'],
+                _t['extract_public_ips'], _t['extract_entities_from_text'],
+                _t['record_finding'], _t['record_explored_path'], _t['get_investigation_context'],
             ],
             "system_prompt": HISTORY_ANALYZER_PROMPT,
+            "middleware": _build_subagent_middleware(),
+        },
+        {
+            "name": "file_content_analyzer",
+            "description": (
+                "Анализирует содержимое файлов из домашних директорий на malware-паттерны. "
+                "Обнаруживает reverse shell, backdoor, криптомайнеры, обфускацию. "
+                "ОБЯЗАТЕЛЬНО вызови для каждого батча файлов из /root/ и /home/*/. "
+                "Передай ему содержимое файлов в текстовом виде."
+            ),
+            "model": llm,
+            "tools": [
+                _t['record_finding'], _t['record_explored_path'], _t['get_investigation_context'],
+                _t['read_local_file'], _t['list_local_directory'],
+            ],
+            "system_prompt": FILE_CONTENT_ANALYZER_PROMPT,
+            "middleware": _build_subagent_middleware(),
         },
     ]
-    
-    agent = create_deep_agent(
-        name="forensic_deep_agent",
-        model=llm,
-        tools=tools,
+
+    # Основной middleware стек (без FilesystemMiddleware)
+    main_middleware = [
+        TodoListMiddleware(),
+        SubAgentMiddleware(backend=backend, subagents=subagents),
+        SummarizationMiddleware(
+            model=llm,
+            backend=backend,
+            trigger=summarization_defaults["trigger"],
+            keep=summarization_defaults["keep"],
+            trim_tokens_to_summarize=None,
+            truncate_args_settings=summarization_defaults["truncate_args_settings"],
+        ),
+        PatchToolCallsMiddleware(),
+    ]
+
+    agent = create_agent(
+        llm,
         system_prompt=system_prompt,
-        subagents=subagents,
-    )
-    
-    logger.info("Forensic Deep Agent created with 4 subagents")
+        tools=tools,
+        middleware=main_middleware,
+        name="forensic_deep_agent",
+    ).with_config({"recursion_limit": 1000})
+
+    logger.info("Forensic Deep Agent created with 5 subagents (incl. general-purpose)")
     return agent
 
 
@@ -387,98 +496,88 @@ def _resolve_image_globs(paths: List[str]) -> List[str]:
 
 # ==================== SUMMARY BUILDERS ====================
 
-def _build_triage_summary(triage_data: Dict) -> str:
-    """Сформировать краткую сводку собранных артефактов для Deep Agent."""
+def _build_enriched_baseline_context(triage_data: Dict, analysis_result: Dict) -> str:
+    """Сформировать обогащённую сводку baseline-данных для Deep Agent.
+
+    Включает конкретные аномалии с деталями (команды, пользователи, сервисы),
+    а не только подсчёты. Оптимизирована по размеру для контекстного окна GigaChat.
+    """
+    if not analysis_result:
+        return "Базовый анализ не выполнен."
+
     parts = []
-    
-    # ОС
+
+    # --- ОС ---
     os_info = triage_data.get('os_info', {})
     if os_info:
         os_release = os_info.get('/etc/os-release', '')
         if os_release:
             for line in os_release.split('\n'):
                 if line.startswith('PRETTY_NAME='):
-                    os_name = line.split('=', 1)[1].strip('"')
-                    parts.append(f"ОС: {os_name}")
-                    # parts.append(f"ОС: {line.split('=', 1)[1].strip('\"')}")
+                    os_ = line.split('=', 1)[1].strip('\"')
+                    parts.append(f"ОС: {os_}")
                     break
-    
-    # Пользователи
-    passwd = triage_data.get('passwd', '')
-    if passwd:
-        user_count = len([l for l in passwd.split('\n') if l.strip() and not l.startswith('#')])
-        parts.append(f"Пользователей в /etc/passwd: {user_count}")
-    
-    shadow = triage_data.get('shadow', '')
-    if shadow:
-        parts.append(f"Файл /etc/shadow: доступен ({len(shadow)} символов)")
-    
-    # История
-    history = triage_data.get('history', {})
-    if history:
-        total_cmds = sum(len(cmds) if isinstance(cmds, list) else 0 for cmds in history.values())
-        parts.append(f"Пользователей с историей: {len(history)}, всего команд: {total_cmds}")
-    
-    # Сервисы
-    services = triage_data.get('services', {})
-    if services:
-        total_svc = services.get('total_services', 0)
-        parts.append(f"Сервисов: {total_svc}")
-    
-    # Cron
-    cron = triage_data.get('cron', {})
-    if cron:
-        parts.append(f"Cron-данные: собраны")
-    
-    # Пакеты
-    packages = triage_data.get('packages', {})
-    if packages:
-        parts.append(f"Пакеты: собраны")
-    
-    # Docker
+
+    # --- Статистика ---
+    summary = analysis_result.get('summary', {})
+    stats_items = []
+    if summary.get('total_users'):
+        stats_items.append(f"пользователей: {summary['total_users']}")
+    if summary.get('total_commands'):
+        stats_items.append(f"команд в истории: {summary['total_commands']}")
+    if summary.get('total_services'):
+        stats_items.append(f"сервисов: {summary['total_services']}")
+    if stats_items:
+        parts.append(f"Статистика: {', '.join(stats_items)}")
+
+    # --- Docker ---
     docker = triage_data.get('docker', {})
     if docker and docker.get('docker_installed'):
         parts.append(f"Docker: установлен, контейнеров: {len(docker.get('containers', []))}")
-    
-    # SSH
+
+    # --- SSH ---
     ssh = triage_data.get('ssh', {})
-    if ssh:
-        ak = ssh.get('authorized_keys', {})
-        parts.append(f"SSH: пользователей с authorized_keys: {len(ak)}")
-    
-    # Auth logs
-    auth_logs = triage_data.get('auth_logs', {})
-    if auth_logs:
-        parts.append(f"Auth logs: собраны")
-    
-    return "\n".join(f"- {p}" for p in parts) if parts else "Данные триажа не собраны."
+    if ssh and ssh.get('authorized_keys'):
+        parts.append(f"SSH: {len(ssh['authorized_keys'])} пользователей с authorized_keys")
 
-
-def _build_analysis_summary(analysis_result: Dict) -> str:
-    """Сформировать краткую сводку алгоритмического анализа."""
-    if not analysis_result:
-        return "Алгоритмический анализ не выполнен."
-    
-    parts = []
-    summary = analysis_result.get('summary', {})
+    # --- Аномалии (главная часть) ---
     anomalies = analysis_result.get('anomalies', [])
-    
-    parts.append(f"Пользователей: {summary.get('total_users', 0)}")
-    parts.append(f"Команд: {summary.get('total_commands', 0)}")
-    parts.append(f"Сервисов: {summary.get('total_services', 0)}")
-    parts.append(f"Аномалий обнаружено: {len(anomalies)}")
-    
     if anomalies:
-        parts.append("\nАномалии:")
-        for i, a in enumerate(anomalies[:10], 1):
-            severity = a.get('severity', '?').upper()
-            atype = a.get('type', '?')
-            desc = a.get('description', a.get('command', ''))[:100]
-            user = a.get('user', '')
-            parts.append(f"  {i}. [{severity}] {atype}: {desc}" + (f" (user: {user})" if user else ""))
-        if len(anomalies) > 10:
-            parts.append(f"  ... и ещё {len(anomalies) - 10} аномалий")
-    
+        by_severity: Dict[str, list] = {}
+        for a in anomalies:
+            sev = a.get('severity', 'medium').lower()
+            by_severity.setdefault(sev, []).append(a)
+
+        parts.append(f"\n=== ОБНАРУЖЕННЫЕ АНОМАЛИИ ({len(anomalies)}) ===")
+
+        shown = 0
+        max_total = 50
+        for sev in ['critical', 'high', 'medium', 'low']:
+            items = by_severity.get(sev, [])
+            if not items:
+                continue
+            parts.append(f"\n[{sev.upper()}] — {len(items)} шт:")
+            limit = len(items) if sev in ('critical', 'high') else min(len(items), max_total - shown)
+            for a in items[:limit]:
+                atype = a.get('type', '?')
+                line_parts = [f"  - {atype}"]
+                if a.get('user'):
+                    line_parts.append(f"user={a['user']}")
+                if a.get('command'):
+                    line_parts.append(f"cmd: {a['command']}")
+                if a.get('description'):
+                    line_parts.append(a['description'])
+                if a.get('service'):
+                    line_parts.append(f"service={a['service']}")
+                if a.get('pattern'):
+                    line_parts.append(f"pattern={a['pattern']}")
+                parts.append(" | ".join(line_parts))
+                shown += 1
+            if len(items) > limit:
+                parts.append(f"  ... и ещё {len(items) - limit}")
+    else:
+        parts.append("\nАномалий не обнаружено алгоритмическим анализом.")
+
     return "\n".join(parts)
 
 
@@ -620,15 +719,88 @@ def collect_baseline_node(state: ForensicAgentState) -> Dict:
     
     print_status('success', f"Базовый анализ: {len(anomalies)} аномалий, {len(recommendations)} рекомендаций")
     
-    # Сбрасываем хранилище расследования для нового анализа
+    # Сбрасываем хранилище расследования и засеиваем аномалиями из baseline
     store = get_investigation_store()
     store.reset()
-    
+
+    for anomaly in anomalies:
+        atype = anomaly.get('type', 'unknown')
+        severity = anomaly.get('severity', 'medium')
+
+        if atype == 'suspicious_command':
+            title = f"Подозрительная команда ({anomaly.get('pattern', '?')})"
+            details = f"Пользователь {anomaly.get('user', '?')} выполнил: {anomaly.get('command', '?')}"
+            category = 'command'
+        elif atype == 'suspicious_user':
+            title = f"Пользователь с UID 0: {anomaly.get('user', '?')}"
+            details = anomaly.get('description', '')
+            category = 'user'
+        elif atype == 'suspicious_service':
+            title = f"Подозрительный сервис: {anomaly.get('service', '?')}"
+            details = (
+                f"Сервис '{anomaly.get('service', '?')}' содержит паттерн "
+                f"'{anomaly.get('pattern', '?')}' (расположение: {anomaly.get('location', '?')})"
+            )
+            category = 'service'
+        elif atype == 'suspicious_file':
+            title = f"Подозрительный файл: {anomaly.get('file', '?')}"
+            details = anomaly.get('description', f"Имя файла содержит паттерн '{anomaly.get('pattern', '?')}'")
+            category = 'file'
+        else:
+            title = anomaly.get('description', atype)[:100]
+            details = json.dumps(anomaly, ensure_ascii=False)
+            category = atype
+
+        evidence = []
+        if anomaly.get('command'):
+            evidence.append(anomaly['command'])
+
+        store.add_finding(
+            category=category,
+            severity=severity,
+            title=title,
+            details=details,
+            evidence=evidence,
+        )
+
+    if anomalies:
+        print_status('info', f"Засеяно {len(anomalies)} находок из baseline в InvestigationStore")
+
+    # ==================== ДЕТАЛЬНЫЙ АНАЛИЗ ЛОГОВ ====================
+    print_status('info', "Запуск детального анализа логов...")
+    log_analysis: Dict[str, Any] = {}
+    log_tools = [
+        ('analyze_utmp_logs', analyze_utmp_logs, {}),
+        ('analyze_auth_logs_detailed', analyze_auth_logs_detailed, {}),
+        ('analyze_lastlog', analyze_lastlog, {}),
+        ('analyze_dpkg_logs', analyze_dpkg_logs, {}),
+        ('analyze_history_commands', analyze_history_commands, {}),
+        ('analyze_alternatives_logs', analyze_alternatives_logs, {}),
+    ]
+    for log_tool_name, log_tool_func, log_tool_args in log_tools:
+        try:
+            result_json = log_tool_func.invoke(log_tool_args, config=cb)
+            result = json.loads(result_json)
+            log_analysis[log_tool_name] = result
+            if result.get('success'):
+                print_status('success', f"{log_tool_name} завершён")
+            else:
+                print_status('warning', f"{log_tool_name}: {result.get('error', 'unknown')}")
+        except Exception as e:
+            print_status('error', f"{log_tool_name} ошибка: {e}")
+            log_analysis[log_tool_name] = {'success': False, 'error': str(e)}
+
+    # Записываем результаты логанализа в triage_data для отчёта
+    triage_data['log_analysis'] = log_analysis
+
+    # --- Фиксация находок и исследованных путей из логанализа ---
+    _record_log_analysis_findings(log_analysis, store)
+
     messages.append({
         'role': 'assistant',
         'content': f"Baseline сбор завершён. Аномалий: {len(anomalies)}, рекомендаций: {len(recommendations)}.",
     })
-    
+
     return {
         'messages': messages,
         'triage_data': triage_data,
@@ -668,40 +840,81 @@ def deep_analysis_node(state: ForensicAgentState) -> Dict:
     recommendations = state.get('recommendations', [])
     
     # Формируем задание для Deep Agent
-    triage_summary = _build_triage_summary(triage_data)
-    analysis_summary = _build_analysis_summary(analysis_result)
-    
-    # На повторных итерациях передаём контекст предыдущих находок
+    # Обогащённый контекст baseline с конкретными аномалиями
+    baseline_context = _build_enriched_baseline_context(triage_data, analysis_result)
+
+    # На повторных итерациях — компактная сводка + инструкция вызвать get_investigation_context()
     investigation_context = ""
     if iteration > 0:
         prior_paths = state.get('investigated_paths', [])
         prior_findings = state.get('suspicious_findings', [])
-        ctx_parts = []
-        if prior_paths:
-            ctx_parts.append(f"Уже исследовано путей: {len(prior_paths)}")
-            for p in prior_paths[-20:]:  # Последние 20 для контекста
-                suspicious_mark = " [ПОДОЗРИТЕЛЬНО]" if p.get('suspicious') else ""
-                ctx_parts.append(f"  - {p.get('path', '?')}: {p.get('description', '')[:100]}{suspicious_mark}")
-        if prior_findings:
-            ctx_parts.append(f"\nНайдено подозрительных находок: {len(prior_findings)}")
-            for f in prior_findings[-15:]:  # Последние 15
-                ctx_parts.append(f"  - [{f.get('severity', '?').upper()}] {f.get('title', '?')}")
-        ctx_parts.append("\nСфокусируйся на НЕИССЛЕДОВАННЫХ областях и углублённом анализе имеющихся находок.")
+        ctx_parts = [
+            f"Итерация {iteration + 1}/{max_iter}.",
+            f"Исследовано путей: {len(prior_paths)}",
+            f"Подозрительных находок: {len(prior_findings)}",
+        ]
+        severity_counts: Dict[str, int] = {}
+        for f in prior_findings:
+            sev = f.get('severity', 'info').lower()
+            severity_counts[sev] = severity_counts.get(sev, 0) + 1
+        if severity_counts:
+            sev_str = ", ".join(f"{k}: {v}" for k, v in sorted(severity_counts.items()))
+            ctx_parts.append(f"По уровням: {sev_str}")
+        ctx_parts.append("")
+        ctx_parts.append("Вызови get_investigation_context() для полного списка находок и исследованных путей.")
+        ctx_parts.append("Сфокусируйся на НЕИССЛЕДОВАННЫХ областях и углублённом анализе имеющихся находок.")
         investigation_context = "\n".join(ctx_parts)
-    
+
     # Путь к выгруженной ФС образа
     project_root = Path(__file__).resolve().parent.parent.parent
     image_fs_dir = str(project_root / "image_fs")
-    
+
+    # Читаем файлы из home/root для передачи субагенту file_content_analyzer
+    # Только на первой итерации — повторно анализировать те же файлы не нужно
+    home_files_batches: List[List[Dict]] = []
+    MAX_FILE_BATCHES = 3
+    if iteration == 0:
+        try:
+            home_files = read_home_files_for_analysis(image_fs_dir=image_fs_dir)
+            if home_files:
+                # Разбиваем на батчи (~2000 токенов ≈ ~4000 символов на батч)
+                max_batch_chars = 4000
+                current_batch: List[Dict] = []
+                current_chars = 0
+                for f in home_files:
+                    file_chars = len(f['content']) + len(f['path']) + 50  # overhead
+                    if current_batch and current_chars + file_chars > max_batch_chars:
+                        home_files_batches.append(current_batch)
+                        current_batch = []
+                        current_chars = 0
+                    current_batch.append(f)
+                    current_chars += file_chars
+                if current_batch:
+                    home_files_batches.append(current_batch)
+                # Ограничиваем количество батчей (макс. MAX_FILE_BATCHES)
+                # Если батчей больше — объединяем хвостовые в последний батч
+                if len(home_files_batches) > MAX_FILE_BATCHES:
+                    merged_tail: List[Dict] = []
+                    for extra_batch in home_files_batches[MAX_FILE_BATCHES - 1:]:
+                        merged_tail.extend(extra_batch)
+                    home_files_batches = home_files_batches[:MAX_FILE_BATCHES - 1] + [merged_tail]
+                print_status('info', f"Файлы для file_content_analyzer: {len(home_files)} файлов, {len(home_files_batches)} батчей")
+        except Exception as e:
+            print_status('warning', f"Не удалось прочитать файлы для file_content_analyzer: {e}")
+
     task_message = build_deep_agent_task(
-        triage_summary, analysis_summary, recommendations,
-        investigation_context, image_fs_dir=image_fs_dir,
+        baseline_context=baseline_context,
+        recommendations=recommendations,
+        investigation_context=investigation_context,
+        image_fs_dir=image_fs_dir,
+        home_files_batches=home_files_batches if home_files_batches else None,
     )
     
     print_status('info', "Создание Deep Agent...")
     
     # Очищаем кэш инструментов от предыдущих запусков
     clear_tool_cache()
+    clear_log_analyzer_cache()
     
     deep_agent_output = None
     llm_analyses = {}
@@ -859,40 +1072,55 @@ def deep_analysis_node(state: ForensicAgentState) -> Dict:
         deep_agent_output = f"Ошибка Deep Agent: {str(e)}"
         messages.append({'role': 'error', 'content': error_msg})
     
+    # --- Детерминированные данные (SSH-входы, публичные IP) ---
+    # Извлекаются безусловно — не требуют LLM, всегда детерминированы.
+    deterministic = _extract_deterministic_data(triage_data, image_fs_dir=image_fs_dir)
+    for k, v in deterministic.items():
+        if k not in llm_analyses:
+            llm_analyses[k] = v
+
+    # --- Фиксация находок из детерминированных данных ---
+    # SSH-входы с публичных IP и публичные IP из команд → suspicious_findings
+    store = get_investigation_store()
+    det_findings_count = _record_deterministic_findings(deterministic, store)
+    if det_findings_count:
+        print_status('info', f"Зафиксировано {det_findings_count} находок из детерминированного анализа")
+
     # --- Дополнительный LLM-анализ для заполнения отчёта ---
     # Deep Agent выполняет расследование (findings, paths), но не генерирует
     # структурированные данные для секций отчёта (services, cron, packages и т.д.)
-    # Запускаем fallback-анализ для заполнения этих секций.
+    # Запускаем fallback только для недостающих секций (only_keys).
     required_report_keys = ['services', 'cron', 'packages', 'web_software',
-                            'nonstandard_root', 'ssh_logins', 'public_ips',
+                            'nonstandard_root', 'nonstandard_home',
+                            'ssh_logins', 'public_ips',
                             'user_summaries', 'expert_analysis']
     missing_keys = [k for k in required_report_keys if k not in llm_analyses]
-    
+
     if missing_keys:
         print_phase("REPORT ANALYSIS", "Дополнительный LLM-анализ для секций отчёта")
-        print_status('info', f"Секции без данных: {len(missing_keys)} из {len(required_report_keys)}")
-        
+        print_status('info', f"Секции без данных: {', '.join(missing_keys)}")
+
         try:
             fallback_output, fallback_analyses = _fallback_llm_analysis(
                 triage_data, analysis_result, recommendations,
                 image_fs_dir=image_fs_dir,
+                only_keys=missing_keys,
             )
-            # Дополняем llm_analyses только недостающими секциями
             for key in missing_keys:
                 if key in fallback_analyses:
                     llm_analyses[key] = fallback_analyses[key]
-            
-            # Если deep_agent_output пуст, используем fallback
+
             if not deep_agent_output or deep_agent_output == "Deep Agent не вернул текстовый ответ.":
                 deep_agent_output = fallback_output
-            
-            print_status('success', f"Дополнено секций отчёта: {len([k for k in missing_keys if k in llm_analyses])}")
+
+            filled = len([k for k in missing_keys if k in llm_analyses])
+            print_status('success', f"Дополнено секций отчёта: {filled}/{len(missing_keys)}")
         except Exception as e:
             print_status('error', f"Ошибка дополнительного анализа: {e}")
             logger.exception("Supplementary analysis error")
     
     # Синхронизируем данные из InvestigationStore в состояние графа (только дельта)
-    store = get_investigation_store()
+    # store уже получен выше при фиксации детерминированных находок
     store_data = sync_store_to_state(store)
     
     return {
@@ -905,18 +1133,381 @@ def deep_analysis_node(state: ForensicAgentState) -> Dict:
     }
 
 
+def _extract_deterministic_data(
+    triage_data: Dict,
+    image_fs_dir: str = "image_fs",
+) -> Dict[str, Any]:
+    """Извлечь данные, не требующие LLM: SSH-входы, публичные IP, нестандартные файлы (листинг).
+
+    Вызывается безусловно перед любым LLM-анализом (deep agent или fallback).
+
+    Returns:
+        Dict с ключами ssh_logins, public_ips (заполненными, если данные есть).
+    """
+    cb = _cb_config("deterministic_extraction")
+    result: Dict[str, Any] = {}
+
+    # SSH успешные входы
+    auth_logs = triage_data.get('auth_logs', {})
+    if auth_logs:
+        try:
+            auth_content = ""
+            if isinstance(auth_logs, dict):
+                for val in auth_logs.values():
+                    if isinstance(val, str):
+                        auth_content += val + "\n"
+                    elif isinstance(val, dict) and 'content' in val:
+                        auth_content += val['content'] + "\n"
+            elif isinstance(auth_logs, str):
+                auth_content = auth_logs
+
+            if auth_content:
+                ssh_result_json = parse_ssh_successful_logins.invoke({"auth_log_content": auth_content}, config=cb)
+                ssh_result = json.loads(ssh_result_json)
+                result['ssh_logins'] = ssh_result
+                print_status('success', f"SSH входов: {ssh_result.get('total_logins', 0)}")
+        except Exception as e:
+            print_status('error', f"Ошибка парсинга SSH: {e}")
+
+    # Публичные IP из истории команд
+    history = triage_data.get('history', {})
+    if history:
+        try:
+            all_commands_text = ""
+            for cmds in history.values():
+                if isinstance(cmds, list):
+                    all_commands_text += "\n".join(cmds) + "\n"
+                elif isinstance(cmds, str):
+                    all_commands_text += cmds + "\n"
+
+            ips_result_json = extract_public_ips.invoke({"text": all_commands_text}, config=cb)
+            ips_result = json.loads(ips_result_json)
+            result['public_ips'] = ips_result
+            print_status('success', f"Публичных IP: {ips_result.get('total_public', 0)}")
+        except Exception as e:
+            print_status('error', f"Ошибка извлечения IP: {e}")
+
+    # Листинг /home/ (2-уровневый: пользователи + их файлы)
+    try:
+        home_dir = f"{image_fs_dir}/home"
+        home_json = list_local_directory.invoke({"dir_path": home_dir}, config=cb)
+        home_data = json.loads(home_json)
+        if home_data.get('success'):
+            home_tree: Dict[str, list] = {}
+            for entry in home_data.get('entries', []):
+                if entry.get('type') == 'directory' and entry.get('name') not in ('.', '..'):
+                    user_dir = f"{home_dir}/{entry['name']}"
+                    try:
+                        user_json = list_local_directory.invoke({"dir_path": user_dir}, config=cb)
+                        user_data = json.loads(user_json)
+                        home_tree[entry['name']] = user_data.get('entries', []) if user_data.get('success') else []
+                    except Exception:
+                        home_tree[entry['name']] = []
+            result['home_listing'] = home_tree
+            print_status('success', f"Листинг /home/: {len(home_tree)} пользователей")
+        else:
+            result['home_listing'] = None
+            print_status('warning', "Каталог /home/ не найден")
+    except Exception as e:
+        result['home_listing'] = None
+        print_status('warning', f"Ошибка листинга /home/: {e}")
+
+    # Листинг /root/
+    try:
+        root_home_dir = f"{image_fs_dir}/root"
+        root_json = list_local_directory.invoke({"dir_path": root_home_dir}, config=cb)
+        root_data = json.loads(root_json)
+        if root_data.get('success'):
+            result['root_listing'] = root_data.get('entries', [])
+            print_status('success', f"Листинг /root/: {len(result['root_listing'])} записей")
+        else:
+            result['root_listing'] = None
+            print_status('warning', "Каталог /root/ не найден")
+    except Exception as e:
+        result['root_listing'] = None
+        print_status('warning', f"Ошибка листинга /root/: {e}")
+
+    # Сканирование файлов в home/root на malware-паттерны (через @tool)
+    try:
+        scan_result_json = scan_home_files_for_malware.invoke(
+            {"image_fs_dir": image_fs_dir}, config=cb
+        )
+        scan_result = json.loads(scan_result_json)
+        malware_hits = scan_result.get('hits', [])
+        if malware_hits:
+            result['malware_hits'] = malware_hits
+            print_status('warning', f"Обнаружено {len(malware_hits)} malware-индикаторов в файлах!")
+        else:
+            print_status('success', "Malware-паттерны в файлах home/root не обнаружены")
+    except Exception as e:
+        print_status('error', f"Ошибка сканирования файлов: {e}")
+
+    return result
+
+
+def _record_deterministic_findings(
+    deterministic: Dict[str, Any],
+    store,
+) -> int:
+    """Зафиксировать находки из детерминированных данных в InvestigationStore.
+
+    Создаёт находки для:
+    - SSH-входов с публичных IP-адресов (severity=high)
+    - Публичных IP-адресов в истории команд (severity=medium)
+    - Malware-паттернов в файлах home/root (severity по паттерну)
+
+    Дедупликация выполняется автоматически через store.add_finding().
+
+    Returns:
+        Количество новых (не дублирующихся) находок.
+    """
+    initial_count = len(store.suspicious_findings)
+
+    # SSH-входы с публичных IP
+    ssh_logins = deterministic.get('ssh_logins', {})
+    if ssh_logins and ssh_logins.get('unique_ips'):
+        summary_by_ip = ssh_logins.get('summary_by_ip', {})
+        for ip in ssh_logins['unique_ips']:
+            if not is_public_ip(ip):
+                continue
+            count = summary_by_ip.get(ip, 1)
+            store.add_finding(
+                category='network',
+                severity='high',
+                title=f'SSH-вход с публичного IP: {ip}',
+                details=f'Обнаружено {count} успешных SSH-входов с публичного IP-адреса {ip}.',
+                evidence=[f'Количество SSH-входов: {count}'],
+            )
+
+    # Публичные IP из истории команд
+    public_ips = deterministic.get('public_ips', {})
+    if public_ips and public_ips.get('public_ips'):
+        for ip in public_ips['public_ips']:
+            store.add_finding(
+                category='network',
+                severity='medium',
+                title=f'Публичный IP в истории команд: {ip}',
+                details=f'IP-адрес {ip} обнаружен в истории команд пользователей. '
+                        f'Требуется проверка контекста использования.',
+                evidence=[f'IP: {ip}'],
+            )
+
+    # Malware-паттерны в файлах home/root
+    malware_hits = deterministic.get('malware_hits', [])
+    for hit in malware_hits:
+        store.add_finding(
+            category='malware',
+            severity=hit['severity'],
+            title=hit['title'],
+            details=hit['details'],
+            evidence=hit.get('evidence', []),
+            related_paths=hit.get('related_paths', []),
+        )
+
+    new_count = len(store.suspicious_findings) - initial_count
+    return new_count
+
+
+def _record_log_analysis_findings(
+    log_analysis: Dict[str, Any],
+    store,
+) -> int:
+    """Зафиксировать находки и исследованные пути из детального анализа логов.
+
+    Записывает в InvestigationStore:
+    - Brute-force атаки из auth.log (critical)
+    - Хосты с неуспешными И успешными входами из btmp/wtmp (high)
+    - Подозрительные команды из bash_history (high)
+    - Исследованные пути для каждого типа лога
+
+    Дедупликация выполняется автоматически через store.add_finding()
+    по ключу (category, title).
+
+    Returns:
+        Количество новых (не дублирующихся) находок.
+    """
+    initial_count = len(store.suspicious_findings)
+
+    # --- auth.log: brute-force detection ---
+    auth_data = log_analysis.get('analyze_auth_logs_detailed', {})
+    if isinstance(auth_data, dict) and auth_data.get('success'):
+        files_str = ', '.join(auth_data.get('files_analyzed', []))
+        store.add_explored_path(
+            path='/var/log/auth.log*',
+            description=f"Детальный анализ auth.log: {auth_data.get('total_events', 0)} событий "
+                        f"(SSH: {auth_data.get('ssh_events', 0)}, sudo: {auth_data.get('sudo_events', 0)}). "
+                        f"Файлы: {files_str}",
+            suspicious=bool(auth_data.get('potentially_bruted_accounts')),
+        )
+
+        bruted = auth_data.get('potentially_bruted_accounts', [])
+        for b in bruted:
+            user = b.get('user', '?')
+            ip = b.get('ip', '?')
+            failed_before = b.get('failed_attempts_before', '?')
+            store.add_finding(
+                category='network',
+                severity='critical',
+                title=f'Brute-force атака → успешный вход: {user}',
+                details=(
+                    f"Обнаружен brute-force: {failed_before} неуспешных попыток, "
+                    f"затем успешный вход пользователя '{user}' с IP {ip} "
+                    f"в {b.get('time', '?')}."
+                ),
+                evidence=[
+                    f"Пользователь: {user}",
+                    f"IP: {ip}",
+                    f"Неуспешных попыток до входа: {failed_before}",
+                    f"Время успешного входа: {b.get('time', '?')}",
+                ],
+                related_paths=['/var/log/auth.log'],
+            )
+
+        # Хосты с большим количеством неуспешных SSH-входов
+        failed_by_host = auth_data.get('failed_by_host', [])
+        for host_info in failed_by_host:
+            attempts = host_info.get('total_attempts', 0)
+            if attempts >= 50:
+                ip = host_info.get('ip', '?')
+                store.add_finding(
+                    category='network',
+                    severity='high',
+                    title=f'Массовый brute-force с IP: {ip}',
+                    details=(
+                        f"IP {ip}: {attempts} неуспешных SSH-входов, "
+                        f"{host_info.get('unique_users', 0)} уникальных пользователей, "
+                        f"{host_info.get('active_days', 0)} активных дней."
+                    ),
+                    evidence=[f"Всего попыток: {attempts}"],
+                    related_paths=['/var/log/auth.log'],
+                )
+
+    # --- btmp/wtmp: корреляции ---
+    utmp_data = log_analysis.get('analyze_utmp_logs', {})
+    if isinstance(utmp_data, dict) and utmp_data.get('success'):
+        files_str = ', '.join(utmp_data.get('files_analyzed', []))
+        store.add_explored_path(
+            path='/var/log/btmp,wtmp',
+            description=f"Анализ btmp/wtmp: {utmp_data.get('failed_logins_count', 0)} неуспешных, "
+                        f"{utmp_data.get('successful_logins_count', 0)} успешных входов. "
+                        f"Файлы: {files_str}",
+            suspicious=bool(utmp_data.get('hosts_in_both_btmp_wtmp')),
+        )
+
+        hosts_both = utmp_data.get('hosts_in_both_btmp_wtmp', [])
+        if hosts_both:
+            hosts_str = ', '.join(hosts_both[:10])
+            store.add_finding(
+                category='network',
+                severity='high',
+                title='Хосты с неуспешными И успешными входами (btmp/wtmp)',
+                details=(
+                    f"Обнаружено {len(hosts_both)} хостов, с которых были и неуспешные, "
+                    f"и успешные входы: {hosts_str}. "
+                    f"Возможный brute-force с последующим успешным проникновением."
+                ),
+                evidence=[f"Хосты: {hosts_str}"],
+                related_paths=['/var/log/btmp', '/var/log/wtmp'],
+            )
+
+        date_diff = utmp_data.get('btmp_wtmp_date_difference_days')
+        if date_diff is not None and abs(date_diff) > 30:
+            store.add_finding(
+                category='config',
+                severity='medium',
+                title='Подозрительная разница дат btmp/wtmp',
+                details=(
+                    f"Разница между последними записями btmp и wtmp: {date_diff} дней. "
+                    f"Может указывать на чистку логов."
+                ),
+                evidence=[f"Разница дат: {date_diff} дней"],
+                related_paths=['/var/log/btmp', '/var/log/wtmp'],
+            )
+
+    # --- lastlog: исследованный путь ---
+    lastlog_data = log_analysis.get('analyze_lastlog', {})
+    if isinstance(lastlog_data, dict) and lastlog_data.get('success'):
+        store.add_explored_path(
+            path='/var/log/lastlog',
+            description=f"Анализ lastlog: {lastlog_data.get('total_entries', 0)} записей о последних входах",
+        )
+
+    # --- dpkg.log: исследованный путь ---
+    dpkg_data = log_analysis.get('analyze_dpkg_logs', {})
+    if isinstance(dpkg_data, dict) and dpkg_data.get('success'):
+        store.add_explored_path(
+            path='/var/log/dpkg.log*',
+            description=(
+                f"Анализ dpkg.log: {dpkg_data.get('total_records', 0)} записей. "
+                f"Установлено: {dpkg_data.get('installed_count', 0)}, "
+                f"удалено: {dpkg_data.get('removed_count', 0)}, "
+                f"purge: {dpkg_data.get('purged_count', 0)}"
+            ),
+            suspicious=dpkg_data.get('removed_count', 0) > 0 or dpkg_data.get('purged_count', 0) > 0,
+        )
+
+    # --- bash_history: подозрительные команды ---
+    hist_data = log_analysis.get('analyze_history_commands', {})
+    if isinstance(hist_data, dict) and hist_data.get('success'):
+        total_susp = hist_data.get('total_suspicious_commands', 0)
+        store.add_explored_path(
+            path='/root/.bash_history, /home/*/.bash_history',
+            description=f"Детальный анализ bash_history: {total_susp} подозрительных команд",
+            suspicious=total_susp > 0,
+        )
+
+        # Записываем подозрительные команды как находки (дедупликация по title)
+        for path_key, info in hist_data.get('analysis', {}).items():
+            susp_cmds = info.get('suspicious_commands', [])
+            if susp_cmds:
+                # Группируем все подозрительные команды из одного файла в одну находку
+                cmds_preview = susp_cmds[:10]
+                store.add_finding(
+                    category='command',
+                    severity='high',
+                    title=f'Подозрительные команды в {path_key}',
+                    details=(
+                        f"Обнаружено {len(susp_cmds)} подозрительных команд в файле {path_key}. "
+                        f"Включают потенциально опасные утилиты, reverse shell, "
+                        f"сокрытие следов или повышение привилегий."
+                    ),
+                    evidence=cmds_preview,
+                    related_paths=[path_key],
+                )
+
+    # --- alternatives.log: исследованный путь ---
+    alt_data = log_analysis.get('analyze_alternatives_logs', {})
+    if isinstance(alt_data, dict) and alt_data.get('success'):
+        store.add_explored_path(
+            path='/var/log/alternatives.log*',
+            description=f"Анализ alternatives.log: {alt_data.get('total_changes', 0)} изменений",
+        )
+
+    new_count = len(store.suspicious_findings) - initial_count
+    if new_count:
+        print_status('info', f"Зафиксировано {new_count} находок из анализа логов")
+    else:
+        print_status('success', "Подозрительных находок в логах не обнаружено")
+
+    return new_count
+
+
 def _fallback_llm_analysis(
     triage_data: Dict,
     analysis_result: Dict,
     recommendations: List[str],
     image_fs_dir: str = "image_fs",
+    only_keys: Optional[List[str]] = None,
 ) -> tuple:
     """
     Fallback: прямой LLM-анализ через GigaChat без Deep Agents SDK.
-    
-    Используется если deepagents не установлен. Выполняет тот же анализ,
-    но без субагентов, планирования и файловой системы.
-    
+
+    Используется если deepagents не установлен, а также для дополнения
+    секций отчёта, которые Deep Agent не заполнил.
+
+    Args:
+        only_keys: Если задан, анализировать только эти секции (оптимизация).
+
     Returns:
         (deep_agent_output, llm_analyses)
     """
@@ -931,14 +1522,18 @@ def _fallback_llm_analysis(
     
     # Устанавливаем текущий узел для логирования (LLM-вызовы + tool.invoke)
     cb = _cb_config("fallback_analysis")
-    
+
+    def _need(key: str) -> bool:
+        """Нужно ли анализировать эту секцию."""
+        return only_keys is None or key in only_keys
+
     llm = create_gigachat_llm()
     llm_analyses = {}
     all_outputs = []
-    
+
     # 1. Анализ сервисов
     services = triage_data.get('services', {})
-    if services:
+    if services and _need('services'):
         print_status('info', "LLM: Анализ сервисов...")
         try:
             services_str = json.dumps(services, ensure_ascii=False)[:4000]
@@ -953,7 +1548,7 @@ def _fallback_llm_analysis(
     
     # 2. Анализ cron
     cron = triage_data.get('cron', {})
-    if cron:
+    if cron and _need('cron'):
         print_status('info', "LLM: Анализ cron-задач...")
         try:
             cron_str = json.dumps(cron, ensure_ascii=False)[:4000]
@@ -968,7 +1563,7 @@ def _fallback_llm_analysis(
     
     # 3. Анализ пакетов
     packages = triage_data.get('packages', {})
-    if packages:
+    if packages and _need('packages'):
         print_status('info', "LLM: Анализ пакетов...")
         try:
             packages_str = json.dumps(packages, ensure_ascii=False)[:4000]
@@ -982,7 +1577,7 @@ def _fallback_llm_analysis(
             print_status('error', f"Ошибка анализа пакетов: {e}")
     
     # 4. Веб-серверы и ПО
-    if services or packages:
+    if (services or packages) and _need('web_software'):
         print_status('info', "LLM: Анализ веб-серверов и ПО...")
         try:
             svc_str = json.dumps(services, ensure_ascii=False)[:2000]
@@ -998,7 +1593,7 @@ def _fallback_llm_analysis(
     
     # 5. Саммари по пользователям
     history = triage_data.get('history', {})
-    if history:
+    if history and _need('user_summaries'):
         user_summaries = {}
         for username, commands in history.items():
             if not commands:
@@ -1018,76 +1613,82 @@ def _fallback_llm_analysis(
             all_outputs.append(f"=== САММАРИ ПОЛЬЗОВАТЕЛЕЙ ===\n{json.dumps(user_summaries, ensure_ascii=False, indent=2)}")
             print_status('success', f"Саммари для {len(user_summaries)} пользователей")
     
-    # 6. SSH успешные входы
-    auth_logs = triage_data.get('auth_logs', {})
-    if auth_logs:
-        print_status('info', "Парсинг успешных SSH-входов...")
-        try:
-            auth_content = ""
-            if isinstance(auth_logs, dict):
-                for key, val in auth_logs.items():
-                    if isinstance(val, str):
-                        auth_content += val + "\n"
-                    elif isinstance(val, dict) and 'content' in val:
-                        auth_content += val['content'] + "\n"
-            elif isinstance(auth_logs, str):
-                auth_content = auth_logs
-            
-            if auth_content:
-                ssh_result_json = parse_ssh_successful_logins.invoke({"auth_log_content": auth_content}, config=cb)
-                ssh_result = json.loads(ssh_result_json)
-                llm_analyses['ssh_logins'] = ssh_result
-                print_status('success', f"SSH входов: {ssh_result.get('total_logins', 0)}")
-        except Exception as e:
-            print_status('error', f"Ошибка парсинга SSH: {e}")
-    
-    # 7. Извлечение публичных IP из истории
-    if history:
-        print_status('info', "Извлечение публичных IP из истории команд...")
-        try:
-            all_commands_text = ""
-            for user, cmds in history.items():
-                if isinstance(cmds, list):
-                    all_commands_text += "\n".join(cmds) + "\n"
-                elif isinstance(cmds, str):
-                    all_commands_text += cmds + "\n"
-            
-            ips_result_json = extract_public_ips.invoke({"text": all_commands_text}, config=cb)
-            ips_result = json.loads(ips_result_json)
-            llm_analyses['public_ips'] = ips_result
-            print_status('success', f"Публичных IP: {ips_result.get('total_public', 0)}")
-        except Exception as e:
-            print_status('error', f"Ошибка извлечения IP: {e}")
-    
-    # 8. Нестандартные файлы в корне
-    print_status('info', "Проверка корневой директории...")
-    try:
-        root_listing_json = list_local_directory.invoke({"dir_path": image_fs_dir}, config=cb)
-        root_listing = json.loads(root_listing_json)
-        if root_listing.get('success'):
-            entries = root_listing.get('entries', [])
-            listing_str = json.dumps(entries, ensure_ascii=False)[:3000]
-            prompt = IDENTIFY_NONSTANDARD_FILES_PROMPT.format(
-                directory="/", directory_listing=listing_str
-            )
-            response = llm.invoke(prompt)
-            content = getattr(response, 'content', str(response))
-            llm_analyses['nonstandard_root'] = content
-            all_outputs.append(f"=== НЕСТАНДАРТНЫЕ ФАЙЛЫ (/) ===\n{content}")
-            print_status('success', "Корневая директория проанализирована")
-    except Exception as e:
-        print_status('error', f"Ошибка анализа корня: {e}")
-    
-    # 9. Общий экспертный анализ
-    print_status('info', "LLM: Формирование экспертного заключения...")
-    try:
-        expert_prompt = f"""Ты — эксперт по кибербезопасности. На основе собранных данных проведи анализ.
+    # SSH и публичные IP теперь извлекаются в _extract_deterministic_data()
 
-ДАННЫЕ ТРИАЖА:
-{_build_triage_summary(triage_data)}
+    # 6. Нестандартные файлы в корне
+    if _need('nonstandard_root'):
+        print_status('info', "Проверка корневой директории...")
+        try:
+            root_listing_json = list_local_directory.invoke({"dir_path": image_fs_dir}, config=cb)
+            root_listing = json.loads(root_listing_json)
+            if root_listing.get('success'):
+                entries = root_listing.get('entries', [])
+                listing_str = json.dumps(entries, ensure_ascii=False)[:3000]
+                prompt = IDENTIFY_NONSTANDARD_FILES_PROMPT.format(
+                    directory="/", directory_listing=listing_str
+                )
+                response = llm.invoke(prompt)
+                content = getattr(response, 'content', str(response))
+                llm_analyses['nonstandard_root'] = content
+                all_outputs.append(f"=== НЕСТАНДАРТНЫЕ ФАЙЛЫ (/) ===\n{content}")
+                print_status('success', "Корневая директория проанализирована")
+        except Exception as e:
+            print_status('error', f"Ошибка анализа корня: {e}")
 
-АЛГОРИТМИЧЕСКИЙ АНАЛИЗ:
-{_build_analysis_summary(analysis_result)}
+    # 7. Нестандартные файлы в домашних каталогах
+    if _need('nonstandard_home'):
+        print_status('info', "LLM: Анализ нестандартных файлов в домашних каталогах...")
+        try:
+            all_listings = []
+
+            # Собираем листинг /home/*
+            home_dir = f"{image_fs_dir}/home"
+            home_json = list_local_directory.invoke({"dir_path": home_dir}, config=cb)
+            home_data = json.loads(home_json)
+            if home_data.get('success'):
+                for entry in home_data.get('entries', []):
+                    if entry.get('type') == 'directory' and entry.get('name') not in ('.', '..'):
+                        user_dir = f"{home_dir}/{entry['name']}"
+                        try:
+                            user_json = list_local_directory.invoke({"dir_path": user_dir}, config=cb)
+                            user_data = json.loads(user_json)
+                            if user_data.get('success') and user_data.get('entries'):
+                                entries_str = json.dumps(user_data['entries'], ensure_ascii=False)[:2000]
+                                all_listings.append(f"/home/{entry['name']}/:\n{entries_str}")
+                        except Exception:
+                            pass
+
+            # Собираем листинг /root/
+            root_home_dir = f"{image_fs_dir}/root"
+            root_json = list_local_directory.invoke({"dir_path": root_home_dir}, config=cb)
+            root_data = json.loads(root_json)
+            if root_data.get('success') and root_data.get('entries'):
+                entries_str = json.dumps(root_data['entries'], ensure_ascii=False)[:2000]
+                all_listings.append(f"/root/:\n{entries_str}")
+
+            if all_listings:
+                listing_combined = "\n\n".join(all_listings)[:5000]
+                prompt = IDENTIFY_NONSTANDARD_FILES_PROMPT.format(
+                    directory="домашние каталоги (/home/*, /root/)",
+                    directory_listing=listing_combined,
+                )
+                response = llm.invoke(prompt)
+                content = getattr(response, 'content', str(response))
+                llm_analyses['nonstandard_home'] = content
+                all_outputs.append(f"=== НЕСТАНДАРТНЫЕ ФАЙЛЫ (HOME) ===\n{content}")
+                print_status('success', "Нестандартные файлы в домашних каталогах проанализированы")
+        except Exception as e:
+            print_status('error', f"Ошибка анализа домашних каталогов: {e}")
+
+    # 8. Общий экспертный анализ
+    if _need('expert_analysis'):
+        print_status('info', "LLM: Формирование экспертного заключения...")
+        try:
+            baseline_ctx = _build_enriched_baseline_context(triage_data, analysis_result)
+            expert_prompt = f"""Ты — эксперт по кибербезопасности. На основе собранных данных проведи анализ.
+
+BASELINE-ДАННЫЕ:
+{baseline_ctx}
 
 РЕКОМЕНДАЦИИ:
 {chr(10).join(f'- {r}' for r in recommendations)}
@@ -1101,13 +1702,13 @@ def _fallback_llm_analysis(
 
 Пиши на русском языке, конкретно и по существу.
 """
-        response = llm.invoke(expert_prompt)
-        expert_content = getattr(response, 'content', str(response))
-        llm_analyses['expert_analysis'] = expert_content
-        all_outputs.append(f"=== ЭКСПЕРТНОЕ ЗАКЛЮЧЕНИЕ ===\n{expert_content}")
-        print_status('success', "Экспертное заключение сформировано")
-    except Exception as e:
-        print_status('error', f"Ошибка экспертного анализа: {e}")
+            response = llm.invoke(expert_prompt)
+            expert_content = getattr(response, 'content', str(response))
+            llm_analyses['expert_analysis'] = expert_content
+            all_outputs.append(f"=== ЭКСПЕРТНОЕ ЗАКЛЮЧЕНИЕ ===\n{expert_content}")
+            print_status('success', "Экспертное заключение сформировано")
+        except Exception as e:
+            print_status('error', f"Ошибка экспертного анализа: {e}")
     
     deep_agent_output = "\n\n".join(all_outputs) if all_outputs else "LLM-анализ не дал результатов."
     return deep_agent_output, llm_analyses

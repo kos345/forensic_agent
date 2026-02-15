@@ -22,6 +22,8 @@ Artifact Tools - Инструменты для сбора криминалист
 """
 
 import json
+import os
+import re
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from langchain_core.tools import tool
@@ -32,29 +34,13 @@ from src.utils.logger import get_logger
 logger = get_logger("ArtifactTools")
 
 # ==================== TOOL RESULT CACHE ====================
-# Prevents the Deep Agent from calling the same tool repeatedly
-# and blowing up the LLM context with duplicate data.
+# Кеш предотвращает повторные вызовы одного и того же инструмента
+# и переполнение контекста LLM дублирующимися данными.
 _tool_result_cache: Dict[str, str] = {}
 
-def _cached_tool_call(cache_key: str, func, **kwargs) -> str:
-    """Return cached result if tool was already called with same params, or call and cache."""
-    if cache_key in _tool_result_cache:
-        logger.info(f"Tool cache HIT: {cache_key}")
-        return json.dumps({
-            "cached": True,
-            "message": f"Данные уже получены ранее (используйте предыдущий результат). Ключ: {cache_key}"
-        }, ensure_ascii=False)
-    result = func(**kwargs)
-    _tool_result_cache[cache_key] = result
-    # Truncate very large results to prevent context overflow (max ~8000 chars)
-    if len(result) > 8000:
-        truncated = result[:7500] + '\n... [ОБРЕЗАНО: результат слишком большой. Показано 7500 из ' + str(len(result)) + ' символов] ...'
-        logger.info(f"Tool result truncated: {cache_key} ({len(result)} -> {len(truncated)} chars)")
-        return truncated
-    return result
 
 def clear_tool_cache():
-    """Clear tool cache (call between runs)."""
+    """Очистить кеш инструментов (вызывать между запусками)."""
     _tool_result_cache.clear()
 
 
@@ -1642,3 +1628,242 @@ def extract_home_files(
     
     logger.info(f"extract_home_files: extracted {len(extracted_files)} files ({total_size} bytes)")
     return json.dumps(result, ensure_ascii=False)
+
+
+# ==================== MALWARE PATTERNS ====================
+
+_MALWARE_PATTERNS = [
+    # Reverse shells
+    (r'/dev/tcp/', 'critical', 'Reverse shell через /dev/tcp'),
+    (r'/dev/udp/', 'critical', 'Reverse shell через /dev/udp'),
+    (r'bash\s+-i\s+>&', 'critical', 'Bash interactive reverse shell'),
+    (r'\bnc\s+.*-e\s+/bin/', 'critical', 'Netcat reverse shell (nc -e)'),
+    (r'\bncat\s+.*-e\s+/bin/', 'critical', 'Ncat reverse shell'),
+    (r'\bsocat\b.*\bexec\b', 'high', 'Socat exec shell'),
+    (r'python.*socket.*connect', 'high', 'Python reverse shell'),
+    (r'perl.*socket.*INET', 'high', 'Perl reverse shell'),
+    (r'ruby.*TCPSocket', 'high', 'Ruby reverse shell'),
+    (r'php.*fsockopen', 'high', 'PHP reverse shell'),
+    (r'mkfifo\s+.*\bsh\b', 'critical', 'Named pipe reverse shell'),
+    # Загрузчики / dropper-ы
+    (r'(wget|curl)\s+.*\|\s*(ba)?sh', 'critical', 'Загрузка и исполнение скрипта из сети'),
+    (r'(wget|curl)\s+.*&&\s*chmod\s+\+x', 'high', 'Загрузка и chmod +x'),
+    # Кодирование / обфускация
+    (r'base64\s+(-d|--decode)\s*\|', 'high', 'Base64-декодирование в pipeline'),
+    (r'eval\s*\$\(.*base64', 'critical', 'eval + base64 обфускация'),
+    # Persistence
+    (r'crontab\s+.*-l.*\|.*crontab', 'high', 'Программное добавление в crontab'),
+    # Crypto mining
+    (r'(xmrig|minerd|cpuminer|stratum\+)', 'critical', 'Криптомайнер'),
+]
+
+_MALWARE_COMPILED = [(re.compile(pat, re.IGNORECASE), sev, desc) for pat, sev, desc in _MALWARE_PATTERNS]
+
+
+# ==================== SCAN HOME FILES FOR MALWARE ====================
+
+@tool
+def scan_home_files_for_malware(image_fs_dir: str = "image_fs") -> str:
+    """Детерминированное сканирование файлов в home/root на malware-паттерны.
+
+    Сканирует текстовые файлы в /root/ и /home/*/ на:
+    - Reverse shell паттерны (/dev/tcp, bash -i, nc -e и т.д.)
+    - Backdoor-индикаторы (eval, base64-декодирование, загрузчики)
+    - Криптомайнеры
+
+    Ограничения:
+    - Файлы > 1MB пропускаются (вероятно бинарники)
+    - Максимум 500 файлов суммарно
+    - Только 1-й уровень вложенности
+
+    Args:
+        image_fs_dir: Путь к директории с выгруженной ФС образа
+
+    Returns:
+        JSON с результатами сканирования: {success, hits, files_scanned, dirs_scanned}
+    """
+    hits: List[Dict[str, Any]] = []
+    files_scanned = 0
+    max_files = 500
+    max_file_size = 1_000_000  # 1MB
+
+    # Собираем директории для сканирования: /root/ + /home/*/
+    dirs_to_scan: List[str] = []
+
+    root_home = os.path.join(image_fs_dir, "root")
+    if os.path.isdir(root_home):
+        dirs_to_scan.append(root_home)
+
+    home_dir = os.path.join(image_fs_dir, "home")
+    if os.path.isdir(home_dir):
+        try:
+            for entry in os.listdir(home_dir):
+                entry_path = os.path.join(home_dir, entry)
+                if os.path.isdir(entry_path) and not entry.startswith('.'):
+                    dirs_to_scan.append(entry_path)
+        except OSError:
+            pass
+
+    for scan_dir in dirs_to_scan:
+        if files_scanned >= max_files:
+            break
+
+        try:
+            entries = os.listdir(scan_dir)
+        except OSError:
+            continue
+
+        for fname in entries:
+            if files_scanned >= max_files:
+                break
+
+            file_path = os.path.join(scan_dir, fname)
+
+            # Пропускаем директории и симлинки
+            if os.path.isdir(file_path):
+                continue
+
+            try:
+                file_size = os.path.getsize(file_path)
+            except OSError:
+                continue
+
+            if file_size > max_file_size or file_size == 0:
+                continue
+
+            files_scanned += 1
+
+            try:
+                with open(file_path, 'r', errors='ignore') as f:
+                    content = f.read()
+            except (OSError, UnicodeDecodeError):
+                continue
+
+            if not content:
+                continue
+
+            # Проверяем каждый malware-паттерн
+            for regex, severity, description in _MALWARE_COMPILED:
+                match = regex.search(content)
+                if match:
+                    matched_line = match.group(0)[:200]
+                    start = max(0, match.start() - 40)
+                    end = min(len(content), match.end() + 40)
+                    context_snippet = content[start:end].strip().replace('\n', ' ')[:300]
+
+                    # Путь внутри образа (без image_fs/ префикса)
+                    image_path = file_path.replace(image_fs_dir, "", 1)
+                    if not image_path.startswith("/"):
+                        image_path = "/" + image_path
+
+                    hits.append({
+                        'severity': severity,
+                        'title': f'{description}: {image_path}',
+                        'details': (
+                            f'Файл {image_path} содержит malware-паттерн. '
+                            f'Совпадение: "{matched_line}". '
+                            f'Контекст: {context_snippet}'
+                        ),
+                        'evidence': [
+                            f'Файл: {image_path}',
+                            f'Паттерн: {description}',
+                            f'Совпадение: {matched_line}',
+                        ],
+                        'related_paths': [image_path],
+                    })
+
+    result = {
+        "success": True,
+        "hits": hits,
+        "total_hits": len(hits),
+        "files_scanned": files_scanned,
+        "dirs_scanned": len(dirs_to_scan),
+    }
+
+    logger.info(f"scan_home_files_for_malware: {files_scanned} files scanned, {len(hits)} hits")
+    return json.dumps(result, ensure_ascii=False)
+
+
+def read_home_files_for_analysis(image_fs_dir: str = "image_fs") -> List[Dict[str, str]]:
+    """Прочитать содержимое маленьких файлов из /root/ и /home/*/ для LLM-анализа.
+
+    Не является @tool — вспомогательная функция для батчинга файлов
+    перед отправкой субагенту file_content_analyzer.
+
+    Args:
+        image_fs_dir: Путь к директории с выгруженной ФС образа
+
+    Returns:
+        Список [{path, content, size}] для каждого прочитанного файла.
+    """
+    files: List[Dict[str, str]] = []
+    max_files = 200
+    max_file_size = 100_000  # 100KB — только маленькие текстовые файлы
+    files_read = 0
+
+    # Собираем директории: /root/ + /home/*/
+    dirs_to_scan: List[str] = []
+
+    root_home = os.path.join(image_fs_dir, "root")
+    if os.path.isdir(root_home):
+        dirs_to_scan.append(root_home)
+
+    home_dir = os.path.join(image_fs_dir, "home")
+    if os.path.isdir(home_dir):
+        try:
+            for entry in os.listdir(home_dir):
+                entry_path = os.path.join(home_dir, entry)
+                if os.path.isdir(entry_path) and not entry.startswith('.'):
+                    dirs_to_scan.append(entry_path)
+        except OSError:
+            pass
+
+    for scan_dir in dirs_to_scan:
+        if files_read >= max_files:
+            break
+
+        try:
+            entries = os.listdir(scan_dir)
+        except OSError:
+            continue
+
+        for fname in entries:
+            if files_read >= max_files:
+                break
+
+            file_path = os.path.join(scan_dir, fname)
+
+            if os.path.isdir(file_path):
+                continue
+
+            try:
+                file_size = os.path.getsize(file_path)
+            except OSError:
+                continue
+
+            if file_size > max_file_size or file_size == 0:
+                continue
+
+            try:
+                with open(file_path, 'r', errors='ignore') as f:
+                    content = f.read()
+            except (OSError, UnicodeDecodeError):
+                continue
+
+            if not content.strip():
+                continue
+
+            # Путь внутри образа
+            image_path = file_path.replace(image_fs_dir, "", 1)
+            if not image_path.startswith("/"):
+                image_path = "/" + image_path
+
+            files.append({
+                'path': image_path,
+                'content': content,
+                'size': len(content),
+            })
+            files_read += 1
+
+    logger.info(f"read_home_files_for_analysis: {files_read} files read from {len(dirs_to_scan)} dirs")
+    return files

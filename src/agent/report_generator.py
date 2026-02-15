@@ -6,9 +6,11 @@ Report Generator — Генерация всеобъемлющего HTML-отч
 2. Сведения о системе (ОС, пользователи, shadow, сервисы, cron, пакеты, Docker)
 3. Информация о файлах (корень, /home/, /root/, нестандартные)
 4. Подключения к системе (SSH successful logins)
+4a. Детальный анализ логов (btmp/wtmp, auth.log, lastlog, dpkg, history, alternatives)
 5. Данные об активности пользователей (история, публичные IP, саммари)
 6. Подозрительные находки (из расследования)
 7. Экспертное заключение (Deep Agent / LLM)
+8. Исследованные пути
 """
 
 import json
@@ -464,32 +466,51 @@ def generate_comprehensive_html_report(report_data: Dict[str, Any]) -> str:
     
     # 3.2 /home/
     html += '<h3 id="home-files">3.2 Файловая структура /home/</h3>'
-    extracted_files = triage_data.get('extracted_files', {})
-    if extracted_files:
-        html += f'<div class="code-block">{_escape(json.dumps(extracted_files, ensure_ascii=False, indent=2)[:5000])}</div>'
+    home_listing = llm_analyses.get('home_listing')
+    if home_listing is None:
+        html += '<p><em>Каталог /home/ не найден в образе</em></p>'
+    elif isinstance(home_listing, dict) and home_listing:
+        for user in sorted(home_listing.keys()):
+            entries = home_listing[user]
+            html += f'<h4>/home/{_escape(user)}/</h4>'
+            if entries:
+                html += '<div class="code-block">'
+                for entry in entries:
+                    if isinstance(entry, dict):
+                        name = entry.get('name', '')
+                        if name in ('.', '..'):
+                            continue
+                        etype = entry.get('type', 'file')
+                        suffix = '/' if etype == 'directory' else ''
+                        html += f'{_escape(name)}{suffix}\n'
+                    else:
+                        html += f'{_escape(str(entry))}\n'
+                html += '</div>'
+            else:
+                html += '<p><em>(пустая директория)</em></p>'
     else:
-        # Try to show from investigated paths
-        home_paths = [p for p in investigated_paths if p.get('path', '').startswith('/home')]
-        if home_paths:
-            html += '<table><tr><th>Путь</th><th>Описание</th><th>Подозрительно</th></tr>'
-            for p in home_paths:
-                susp = '⚠️ Да' if p.get('suspicious') else 'Нет'
-                html += f'<tr><td><code>{_escape(p.get("path",""))}</code></td><td>{_escape(p.get("description",""))}</td><td>{susp}</td></tr>'
-            html += '</table>'
-        else:
-            html += '<p><em>Файловая структура /home/ не исследована</em></p>'
-    
+        html += '<p><em>Каталог /home/ пуст</em></p>'
+
     # 3.3 /root/
     html += '<h3 id="root-home">3.3 Файловая структура /root/</h3>'
-    root_paths = [p for p in investigated_paths if p.get('path', '').startswith('/root')]
-    if root_paths:
-        html += '<table><tr><th>Путь</th><th>Описание</th><th>Подозрительно</th></tr>'
-        for p in root_paths:
-            susp = '⚠️ Да' if p.get('suspicious') else 'Нет'
-            html += f'<tr><td><code>{_escape(p.get("path",""))}</code></td><td>{_escape(p.get("description",""))}</td><td>{susp}</td></tr>'
-        html += '</table>'
+    root_listing = llm_analyses.get('root_listing')
+    if root_listing is None:
+        html += '<p><em>Каталог /root/ не найден в образе</em></p>'
+    elif isinstance(root_listing, list) and root_listing:
+        html += '<div class="code-block">'
+        for entry in root_listing:
+            if isinstance(entry, dict):
+                name = entry.get('name', '')
+                if name in ('.', '..'):
+                    continue
+                etype = entry.get('type', 'file')
+                suffix = '/' if etype == 'directory' else ''
+                html += f'{_escape(name)}{suffix}\n'
+            else:
+                html += f'{_escape(str(entry))}\n'
+        html += '</div>'
     else:
-        html += '<p><em>Файловая структура /root/ не исследована</em></p>'
+        html += '<p><em>Каталог /root/ пуст или не найден</em></p>'
     
     # 3.4 Нестандартные файлы пользователей
     html += '<h3 id="nonstandard-home">3.4 Нестандартные файлы в директориях пользователей</h3>'
@@ -551,10 +572,205 @@ def generate_comprehensive_html_report(report_data: Dict[str, Any]) -> str:
             html += '</table>'
     else:
         html += '<p><em>Данные об SSH-подключениях не доступны</em></p>'
-    
+
+    # ==================== 4a. ДЕТАЛЬНЫЙ АНАЛИЗ ЛОГОВ ====================
+    log_analysis = triage_data.get('log_analysis', {})
+    if log_analysis:
+        html += '<div class="section-divider"></div>'
+        html += '<h2 id="log-analysis">4a. 📋 Детальный анализ логов</h2>'
+
+        # --- btmp/wtmp ---
+        utmp_data = log_analysis.get('analyze_utmp_logs')
+        if isinstance(utmp_data, str):
+            try:
+                utmp_data = json.loads(utmp_data)
+            except Exception:
+                utmp_data = None
+        if utmp_data and isinstance(utmp_data, dict) and utmp_data.get('success'):
+            html += '<h3 id="log-utmp">Анализ btmp/wtmp (попытки входа)</h3>'
+            files_str = ', '.join(f'<code>{_escape(f)}</code>' for f in utmp_data.get('files_analyzed', []))
+            html += f'<p><strong>Файлы:</strong> {files_str}</p>'
+            html += f"""
+    <div class="summary">
+        <div class="stat"><div class="stat-label">Неуспешных входов</div><div class="stat-value danger">{utmp_data.get('failed_logins_count', 0)}</div></div>
+        <div class="stat"><div class="stat-label">Успешных входов</div><div class="stat-value success">{utmp_data.get('successful_logins_count', 0)}</div></div>
+    </div>
+"""
+            # Failed by user
+            failed_by_user = utmp_data.get('failed_by_user', [])
+            if failed_by_user:
+                html += '<h4>Неуспешные входы по пользователям</h4>'
+                html += '<table><tr><th>Пользователь</th><th>Уникальных хостов</th><th>Активных дней</th><th>Всего попыток</th></tr>'
+                for row in failed_by_user[:20]:
+                    html += f'<tr><td><code>{_escape(str(row.get("user","")))}</code></td><td>{row.get("unique_hosts",0)}</td><td>{row.get("active_days",0)}</td><td><strong>{row.get("total_attempts",0)}</strong></td></tr>'
+                html += '</table>'
+
+            # Failed by host
+            failed_by_host = utmp_data.get('failed_by_host', [])
+            if failed_by_host:
+                html += '<h4>Неуспешные входы по хостам</h4>'
+                html += '<table><tr><th>Хост</th><th>Уникальных пользователей</th><th>Активных дней</th><th>Всего попыток</th></tr>'
+                for row in failed_by_host[:20]:
+                    html += f'<tr><td><code>{_escape(str(row.get("host","")))}</code></td><td>{row.get("unique_users",0)}</td><td>{row.get("active_days",0)}</td><td><strong>{row.get("total_attempts",0)}</strong></td></tr>'
+                html += '</table>'
+
+            # Successful by user
+            succ_by_user = utmp_data.get('successful_by_user', [])
+            if succ_by_user:
+                html += '<h4>Успешные входы по пользователям</h4>'
+                html += '<table><tr><th>Пользователь</th><th>Уникальных хостов</th><th>Активных дней</th><th>Всего входов</th></tr>'
+                for row in succ_by_user[:20]:
+                    html += f'<tr><td><code>{_escape(str(row.get("user","")))}</code></td><td>{row.get("unique_hosts",0)}</td><td>{row.get("active_days",0)}</td><td><strong>{row.get("total_attempts",0)}</strong></td></tr>'
+                html += '</table>'
+
+            # Correlations
+            hosts_both = utmp_data.get('hosts_in_both_btmp_wtmp', [])
+            if hosts_both:
+                html += f'<div class="anomaly high"><div class="anomaly-header"><span class="anomaly-type">Корреляция btmp/wtmp</span>{_severity_badge("high")}</div>'
+                html += f'<p>Хосты с неуспешными И успешными входами: {", ".join(f"<code>{_escape(h)}</code>" for h in hosts_both[:10])}</p></div>'
+
+            date_diff = utmp_data.get('btmp_wtmp_date_difference_days')
+            if date_diff is not None and date_diff != 0:
+                html += f'<div class="info-box"><p><strong>Разница дат btmp/wtmp:</strong> {date_diff} дней (возможный признак чистки логов)</p></div>'
+
+        # --- auth.log ---
+        auth_data = log_analysis.get('analyze_auth_logs_detailed')
+        if isinstance(auth_data, str):
+            try:
+                auth_data = json.loads(auth_data)
+            except Exception:
+                auth_data = None
+        if auth_data and isinstance(auth_data, dict) and auth_data.get('success'):
+            html += '<h3 id="log-auth">Анализ auth.log (SSH/sudo)</h3>'
+            files_str = ', '.join(f'<code>{_escape(f)}</code>' for f in auth_data.get('files_analyzed', []))
+            html += f'<p><strong>Файлы:</strong> {files_str}</p>'
+            html += f"""
+    <div class="summary">
+        <div class="stat"><div class="stat-label">Всего событий</div><div class="stat-value">{auth_data.get('total_events', 0)}</div></div>
+        <div class="stat"><div class="stat-label">SSH событий</div><div class="stat-value">{auth_data.get('ssh_events', 0)}</div></div>
+        <div class="stat"><div class="stat-label">Sudo событий</div><div class="stat-value">{auth_data.get('sudo_events', 0)}</div></div>
+    </div>
+"""
+            # Brute-force
+            bruted = auth_data.get('potentially_bruted_accounts', [])
+            if bruted:
+                html += f'<div class="anomaly critical"><div class="anomaly-header"><span class="anomaly-type">Brute-Force Detection</span>{_severity_badge("critical")}</div>'
+                for b in bruted[:10]:
+                    html += f'<p><strong>{_escape(str(b.get("user","?")))}</strong> — {b.get("failed_attempts_before","?")} неуспешных → успешный вход с IP <code>{_escape(str(b.get("ip","?")))}</code> в {_escape(str(b.get("time","?")))}</p>'
+                html += '</div>'
+
+            # Failed by host
+            auth_fail_host = auth_data.get('failed_by_host', [])
+            if auth_fail_host:
+                html += '<h4>Неуспешные SSH-входы по IP</h4>'
+                html += '<table><tr><th>IP</th><th>Уникальных пользователей</th><th>Активных дней</th><th>Всего попыток</th></tr>'
+                for row in auth_fail_host[:20]:
+                    html += f'<tr><td><code>{_escape(str(row.get("ip","")))}</code></td><td>{row.get("unique_users",0)}</td><td>{row.get("active_days",0)}</td><td><strong>{row.get("total_attempts",0)}</strong></td></tr>'
+                html += '</table>'
+
+            # Successful by host
+            auth_succ_host = auth_data.get('successful_by_host', [])
+            if auth_succ_host:
+                html += '<h4>Успешные SSH-входы по IP</h4>'
+                html += '<table><tr><th>IP</th><th>Уникальных пользователей</th><th>Активных дней</th><th>Всего входов</th></tr>'
+                for row in auth_succ_host[:20]:
+                    html += f'<tr><td><code>{_escape(str(row.get("ip","")))}</code></td><td>{row.get("unique_users",0)}</td><td>{row.get("active_days",0)}</td><td><strong>{row.get("total_attempts",0)}</strong></td></tr>'
+                html += '</table>'
+
+            # Sudo commands
+            sudo_cmds = auth_data.get('sudo_commands', [])
+            if sudo_cmds:
+                html += '<h4>Sudo-команды</h4><div class="code-block">'
+                for cmd in sudo_cmds[:30]:
+                    time_str = str(cmd.get('time', ''))[:19]
+                    html += f'[{_escape(time_str)}] {_escape(str(cmd.get("user","?")))}: {_escape(str(cmd.get("command","?")))}\n'
+                html += '</div>'
+
+        # --- lastlog ---
+        lastlog_data = log_analysis.get('analyze_lastlog')
+        if isinstance(lastlog_data, str):
+            try:
+                lastlog_data = json.loads(lastlog_data)
+            except Exception:
+                lastlog_data = None
+        if lastlog_data and isinstance(lastlog_data, dict) and lastlog_data.get('success') and lastlog_data.get('entries'):
+            html += '<h3 id="log-lastlog">Анализ lastlog (последние входы)</h3>'
+            files_str = ', '.join(f'<code>{_escape(f)}</code>' for f in lastlog_data.get('files_analyzed', []))
+            html += f'<p><strong>Файлы:</strong> {files_str} | Записей: <strong>{lastlog_data.get("total_entries", 0)}</strong></p>'
+            html += '<table><tr><th>UID</th><th>Пользователь</th><th>Время</th><th>TTY</th><th>Хост</th></tr>'
+            for entry in lastlog_data.get('entries', [])[:30]:
+                html += f'<tr><td>{entry.get("uid","")}</td><td><code>{_escape(str(entry.get("user","")))}</code></td><td>{_escape(str(entry.get("time","")))}</td><td>{_escape(str(entry.get("tty","")))}</td><td><code>{_escape(str(entry.get("host","")))}</code></td></tr>'
+            html += '</table>'
+
+        # --- dpkg.log ---
+        dpkg_data = log_analysis.get('analyze_dpkg_logs')
+        if isinstance(dpkg_data, str):
+            try:
+                dpkg_data = json.loads(dpkg_data)
+            except Exception:
+                dpkg_data = None
+        if dpkg_data and isinstance(dpkg_data, dict) and dpkg_data.get('success'):
+            pkgs_by_action = dpkg_data.get('packages_by_action', {})
+            if pkgs_by_action:
+                html += '<h3 id="log-dpkg">Анализ dpkg.log (пакеты)</h3>'
+                files_str = ', '.join(f'<code>{_escape(f)}</code>' for f in dpkg_data.get('files_analyzed', []))
+                html += f'<p><strong>Файлы:</strong> {files_str}</p>'
+                html += f"""
+    <div class="summary">
+        <div class="stat"><div class="stat-label">Установлено</div><div class="stat-value">{dpkg_data.get('installed_count', 0)}</div></div>
+        <div class="stat"><div class="stat-label">Удалено</div><div class="stat-value warning">{dpkg_data.get('removed_count', 0)}</div></div>
+        <div class="stat"><div class="stat-label">Purged</div><div class="stat-value danger">{dpkg_data.get('purged_count', 0)}</div></div>
+    </div>
+"""
+                for action, packages in pkgs_by_action.items():
+                    if packages:
+                        html += f'<h4>Действие: {_escape(action)}</h4>'
+                        html += f'<div class="code-block">{_escape(", ".join(packages[:50]))}</div>'
+
+        # --- bash_history ---
+        hist_data = log_analysis.get('analyze_history_commands')
+        if isinstance(hist_data, str):
+            try:
+                hist_data = json.loads(hist_data)
+            except Exception:
+                hist_data = None
+        if hist_data and isinstance(hist_data, dict) and hist_data.get('success') and hist_data.get('total_suspicious_commands', 0) > 0:
+            html += f'<h3 id="log-history">Подозрительные команды в истории</h3>'
+            html += f'<p>Всего подозрительных: <strong style="color:#ff6b6b;">{hist_data.get("total_suspicious_commands", 0)}</strong></p>'
+            for hist_path, info in hist_data.get('analysis', {}).items():
+                susp_cmds = info.get('suspicious_commands', [])
+                if susp_cmds:
+                    html += f'<h4>Файл: {_escape(hist_path)}</h4><div class="code-block">'
+                    for cmd in susp_cmds[:30]:
+                        html += f'$ {_escape(cmd)}\n'
+                    if len(susp_cmds) > 30:
+                        html += f'\n... и ещё {len(susp_cmds) - 30} команд'
+                    html += '</div>'
+
+        # --- alternatives.log ---
+        alt_data = log_analysis.get('analyze_alternatives_logs')
+        if isinstance(alt_data, str):
+            try:
+                alt_data = json.loads(alt_data)
+            except Exception:
+                alt_data = None
+        if alt_data and isinstance(alt_data, dict) and alt_data.get('success') and alt_data.get('total_changes', 0) > 0:
+            html += f'<h3 id="log-alternatives">Анализ alternatives.log</h3>'
+            files_str = ', '.join(f'<code>{_escape(f)}</code>' for f in alt_data.get('files_analyzed', []))
+            html += f'<p><strong>Файлы:</strong> {files_str} | Изменений: <strong>{alt_data.get("total_changes", 0)}</strong></p>'
+            changes_by_tool = alt_data.get('changes_by_tool', {})
+            if changes_by_tool:
+                html += '<table><tr><th>Инструмент</th><th>Изменения</th></tr>'
+                for tool_name, tool_messages in list(changes_by_tool.items())[:30]:
+                    msgs_str = _escape('; '.join(tool_messages[:3]))
+                    if len(tool_messages) > 3:
+                        msgs_str += f' ... (+{len(tool_messages) - 3})'
+                    html += f'<tr><td><code>{_escape(tool_name)}</code></td><td>{msgs_str}</td></tr>'
+                html += '</table>'
+
     # ==================== 5. АКТИВНОСТЬ ПОЛЬЗОВАТЕЛЕЙ ====================
     html += '<div class="section-divider"></div>'
-    html += '<h2 id="user-activity">5. 👤 Активность пользователей</h2>'
+    html += '<h2 id="user-activity">5. Активность пользователей</h2>'
     
     # 5.1 История команд
     html += '<h3 id="cmd-history">5.1 История команд</h3>'
@@ -672,9 +888,26 @@ def generate_comprehensive_html_report(report_data: Dict[str, Any]) -> str:
     html += '<h2 id="explored">8. 🗺️ Исследованные пути</h2>'
     
     if investigated_paths:
-        html += f'<p>Всего исследовано: <strong>{len(investigated_paths)}</strong> путей</p>'
-        html += '<table><tr><th>Путь</th><th>Описание</th><th>Подозрительно</th><th>Время</th></tr>'
+        # Дедупликация: объединяем записи с одинаковым path
+        merged_paths: dict = {}
         for p in investigated_paths:
+            key = p.get('path', '')
+            if key in merged_paths:
+                existing = merged_paths[key]
+                new_desc = p.get('description', '')
+                if new_desc and new_desc not in existing['description']:
+                    existing['description'] += f'; {new_desc}'
+                if p.get('suspicious'):
+                    existing['suspicious'] = True
+                if p.get('timestamp', '') > existing.get('timestamp', ''):
+                    existing['timestamp'] = p['timestamp']
+            else:
+                merged_paths[key] = dict(p)
+        deduped = list(merged_paths.values())
+
+        html += f'<p>Всего исследовано: <strong>{len(deduped)}</strong> путей</p>'
+        html += '<table><tr><th>Путь</th><th>Описание</th><th>Подозрительно</th><th>Время</th></tr>'
+        for p in deduped:
             susp = '⚠️ Да' if p.get('suspicious') else '✓ Нет'
             susp_style = ' style="color:#ff6b6b;"' if p.get('suspicious') else ' style="color:#1dd1a1;"'
             html += f'<tr><td><code>{_escape(str(p.get("path","")))}</code></td>'

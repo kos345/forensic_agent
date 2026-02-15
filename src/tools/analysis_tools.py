@@ -563,6 +563,29 @@ def analyze_triage_data(triage_data_json: str) -> str:
             analysis['statistics']['total_files'] = len(iocs)
             analysis['statistics']['total_iocs'] = len(iocs)
     
+    # ========== ИЗВЛЕЧЁННЫЕ ФАЙЛЫ (проверка имён на подозрительность) ==========
+    extracted = data.get('extracted_files')
+    if extracted and isinstance(extracted, dict):
+        files_list = extracted.get('extracted_files', [])
+        if isinstance(files_list, list):
+            suspicious_file_patterns = [
+                'shell', 'backdoor', 'reverse', 'malware', 'hack',
+                'exploit', 'payload', 'miner', 'xmrig', 'c2',
+            ]
+            for f in files_list:
+                source = f.get('source', '') if isinstance(f, dict) else str(f)
+                fname = source.split('/')[-1].lower()
+                for pat in suspicious_file_patterns:
+                    if pat in fname:
+                        anomalies.append({
+                            "type": "suspicious_file",
+                            "severity": "high",
+                            "file": source,
+                            "pattern": pat,
+                            "description": f"Подозрительное имя файла: {source}"
+                        })
+                        break
+
     # ========== АНАЛИЗ СЕРВИСОВ (как в оригинале) ==========
     services_data = data.get('services')
     if services_data:
@@ -606,7 +629,7 @@ def analyze_triage_data(triage_data_json: str) -> str:
         if docker_data and isinstance(docker_data, dict):
             if docker_data.get('docker_installed'):
                 analysis['statistics']['has_docker'] = True
-                recommendations.append("Analyze Docker containers and images for malicious activity")
+                recommendations.append("Docker установлен — проверить контейнеры и образы на вредоносное ПО")
                 if docker_data.get('containers'):
                     analysis['statistics']['docker_containers'] = len(docker_data['containers'])
     
@@ -617,7 +640,10 @@ def analyze_triage_data(triage_data_json: str) -> str:
             if ssh_data.get('authorized_keys'):
                 analysis['statistics']['has_ssh'] = True
                 analysis['statistics']['ssh_users_with_keys'] = len(ssh_data['authorized_keys'])
-                recommendations.append("Review authorized_keys for unauthorized public keys")
+                ak_users = ", ".join(ssh_data['authorized_keys'].keys())
+                recommendations.append(
+                    f"Проверить authorized_keys на неавторизованные ключи у пользователей: {ak_users}"
+                )
             if ssh_data.get('ssh_keys'):
                 analysis['statistics']['ssh_keys_count'] = len(ssh_data['ssh_keys'])
     
@@ -630,15 +656,52 @@ def analyze_triage_data(triage_data_json: str) -> str:
         'analysis_date': datetime.now().isoformat()
     }
     
-    # ========== РЕКОМЕНДАЦИИ ==========
+    # ========== РЕКОМЕНДАЦИИ (конкретные, на основе найденных аномалий) ==========
     if anomalies:
-        recommendations.insert(0, "CRITICAL: Investigate all anomalies listed above")
-    
+        # Группируем аномалии по пользователям и типам для конкретных рекомендаций
+        users_with_suspicious_cmds: Dict[str, set] = {}
+        suspicious_users: list = []
+        suspicious_services: list = []
+        for a in anomalies:
+            atype = a.get('type', '')
+            if atype == 'suspicious_command':
+                user = a.get('user', '?')
+                pattern = a.get('pattern', '?')
+                users_with_suspicious_cmds.setdefault(user, set()).add(pattern)
+            elif atype == 'suspicious_user':
+                suspicious_users.append(a.get('user', '?'))
+            elif atype == 'suspicious_service':
+                suspicious_services.append(a.get('service', '?'))
+
+        for user, patterns in users_with_suspicious_cmds.items():
+            p_str = ", ".join(sorted(patterns))
+            recommendations.insert(0,
+                f"Исследовать активность пользователя '{user}': "
+                f"обнаружены подозрительные паттерны ({p_str}). "
+                f"Проверить загруженные/созданные файлы в home-директории и /tmp."
+            )
+        if suspicious_users:
+            recommendations.insert(0,
+                f"КРИТИЧНО: обнаружены пользователи с UID 0 ({', '.join(suspicious_users)}) — "
+                "проверить /etc/passwd, /etc/shadow, историю команд этих пользователей."
+            )
+        if suspicious_services:
+            recommendations.insert(0,
+                f"Проверить подозрительные сервисы: {', '.join(suspicious_services)}. "
+                "Изучить unit-файлы, бинарники и конфигурации."
+            )
+
     if analysis['statistics'].get('total_commands', 0) > 0:
-        recommendations.append("Perform detailed command history analysis")
-    
+        recommendations.append(
+            "Провести детальный анализ истории команд всех пользователей — "
+            "проверить файлы .bash_history, .zsh_history в home-директориях."
+        )
+
     if analysis['statistics'].get('total_users', 0) > 50:
-        recommendations.append("Large number of users detected - review for unauthorized accounts")
+        recommendations.append(
+            f"Обнаружено много пользователей ({analysis['statistics']['total_users']}) — "
+            "проверить на наличие неавторизованных учётных записей."
+        )
     
     result = {
         "success": True,
